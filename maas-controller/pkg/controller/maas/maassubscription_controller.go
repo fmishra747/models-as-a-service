@@ -50,6 +50,7 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/oteljson"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
@@ -81,6 +82,7 @@ type MaaSSubscriptionReconciler struct {
 //+kubebuilder:rbac:groups=kuadrant.io,resources=tokenratelimitpolicies,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes/finalizers,verbs=update
+//+kubebuilder:rbac:groups=llm-d.ai,resources=inferenceobjectives,verbs=get;list;watch;create;update;patch;delete
 
 const (
 	maasSubscriptionFinalizer = "maas.opendatahub.io/subscription-cleanup"
@@ -138,6 +140,67 @@ func validateTokenRateLimit(limit int64, window string) error {
 	}
 
 	return nil
+}
+
+// errNoTokenBudget reports a model reference with neither tokenRateLimits nor
+// unlimited set. The CRD rejects such a reference, so it only reaches the
+// controller when that validation was bypassed.
+var errNoTokenBudget = errors.New("model reference sets neither tokenRateLimits nor unlimited")
+
+// modelRefTokenRates returns the TRLP rates for a model reference, or
+// unlimited=true when it has no token budget.
+//
+// The CRD makes unlimited and tokenRateLimits mutually exclusive. Should a
+// reference bypass that validation, the declared limits win as the
+// restrictive choice.
+func modelRefTokenRates(mRef maasv1alpha1.ModelSubscriptionRef) (rates []any, unlimited bool, err error) {
+	if len(mRef.TokenRateLimits) == 0 {
+		if mRef.Unlimited {
+			return nil, true, nil
+		}
+		return nil, false, errNoTokenBudget
+	}
+	for _, trl := range mRef.TokenRateLimits {
+		if err := validateTokenRateLimit(trl.Limit, trl.Window); err != nil {
+			return nil, false, err
+		}
+		rates = append(rates, map[string]any{"limit": trl.Limit, "window": trl.Window})
+	}
+	return rates, false, nil
+}
+
+// unlimitedLimitName is the TRLP limit key shared by the unlimited
+// subscriptions of a model. Rate-group keys are "tokens-<limit>-per-<window>"
+// with a positive numeric limit, so it cannot collide with one.
+const unlimitedLimitName = "tokens-unlimited"
+
+// unlimitedTokenLimit returns the TRLP limit matching the given
+// selected_subscription_key values of unlimited subscriptions.
+//
+// Without rates, Limitador enforces nothing and keeps no counters, but the
+// wasm-shim still sends check and report calls for matching requests, and
+// those produce the authorized_hits usage metric. Kuadrant copies every limit
+// into every ActionSet of the gateway's WasmPlugin, so one shared limit costs a
+// predicate clause per unlimited subscription instead of a whole limit
+// (RHOAIENG-95277). It also keeps the TRLP non-empty when every subscription
+// on the model is unlimited: Kuadrant rejects a TRLP without limits, and a
+// route without one falls back to gateway-default-deny.
+//
+// rates and counters stay unset: a nil slice is written as null, which the API
+// server drops, so the no-op update check would never match.
+func unlimitedTokenLimit(keys []string) map[string]any {
+	sort.Strings(keys)
+	matches := make([]string, 0, len(keys))
+	for _, k := range keys {
+		matches = append(matches, fmt.Sprintf(`auth.identity.selected_subscription_key == "%s"`, k))
+	}
+	return map[string]any{
+		"when": []any{
+			map[string]any{
+				"predicate": fmt.Sprintf(`(%s) && !request.path.endsWith("/v1/models")`, strings.Join(matches, " || ")),
+			},
+		},
+	}
 }
 
 // ConditionSpecPriorityDuplicate is set True when another MaaSSubscription in the same namespace shares the same spec.priority
@@ -342,7 +405,8 @@ func deriveFinalPhase(modelStatuses []maasv1alpha1.ModelRefStatus, trlpStatuses 
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logr.FromContextOrDiscard(ctx).WithValues("MaaSSubscription", req.NamespacedName)
+	ctx = oteljson.IntoContext(ctx)
+	log := oteljson.FromContext(ctx).WithValues("MaaSSubscription", req.NamespacedName)
 
 	subscription := &maasv1alpha1.MaaSSubscription{}
 	if err := r.Get(ctx, req.NamespacedName, subscription); err != nil {
@@ -539,44 +603,27 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 		return fmt.Errorf("failed to fetch HTTPRoute %s/%s: %w", httpRouteNS, httpRouteName, err)
 	}
 
-	limitsMap := map[string]any{}
-	var subNames []string
-
-	type subInfo struct {
-		sub   maasv1alpha1.MaaSSubscription
-		mRef  maasv1alpha1.ModelSubscriptionRef
-		rates []any
-	}
 	var subs []subInfo
 	for _, sub := range allSubs {
 		for _, mRef := range sub.Spec.ModelRefs {
 			if mRef.Namespace != modelNamespace || mRef.Name != modelName {
 				continue
 			}
-			var rates []any
-			var hasInvalidLimits bool
-			if len(mRef.TokenRateLimits) > 0 {
-				for _, trl := range mRef.TokenRateLimits {
-					if err := validateTokenRateLimit(trl.Limit, trl.Window); err != nil {
-						log.Error(err, "Skipping subscription with invalid token rate limit — fix the spec to include it in TRLP",
-							"subscription", sub.Name, "model", modelNamespace+"/"+modelName,
-							"limit", trl.Limit, "window", trl.Window)
-						hasInvalidLimits = true
-						break
-					}
-					rates = append(rates, map[string]any{"limit": trl.Limit, "window": trl.Window})
-				}
-			} else {
-				rates = append(rates, map[string]any{"limit": int64(100), "window": "1m"})
-			}
-			if hasInvalidLimits {
+			rates, unlimited, err := modelRefTokenRates(mRef)
+			if err != nil {
 				// Skip this subscription to prevent poisoning the aggregated TRLP.
-				// The subscription is already marked Degraded/Failed by validateModelRefs(),
-				// and maas-api's subscription selector rejects non-Active subscriptions,
-				// so the invalid subscription cannot be used for API key minting.
+				log.Error(err, "Skipping subscription with invalid token budget - fix the spec to include it in TRLP",
+					"subscription", sub.Name, "model", modelNamespace+"/"+modelName)
 				continue
 			}
-			subs = append(subs, subInfo{sub: sub, mRef: mRef, rates: rates})
+			subs = append(subs, subInfo{
+				subNamespace: sub.Namespace,
+				subName:      sub.Name,
+				rates:        rates,
+				unlimited:    unlimited,
+				modelScoped:  fmt.Sprintf("%s/%s@%s/%s", sub.Namespace, sub.Name, mRef.Namespace, mRef.Name),
+				groupKey:     rateGroupKey(rates),
+			})
 			break
 		}
 	}
@@ -599,34 +646,15 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 	//
 	// The selected_subscription_key format is: {subNamespace}/{subName}@{modelNamespace}/{modelName}
 	// This ensures proper isolation between subscriptions in different namespaces and across models.
-	for _, si := range subs {
-		subNames = append(subNames, qualifiedName(si.sub.Namespace, si.sub.Name))
-
-		// Build subscription reference: namespace/name
-		subRef := fmt.Sprintf("%s/%s", si.sub.Namespace, si.sub.Name)
-		// Build model-scoped reference: subscription@model
-		modelScopedRef := fmt.Sprintf("%s@%s/%s", subRef, si.mRef.Namespace, si.mRef.Name)
-
-		// TRLP limit key must be safe for YAML (no slashes)
-		safeKey := strings.ReplaceAll(subRef, "/", "-")
-		limitsMap[fmt.Sprintf("%s-%s-tokens", safeKey, si.mRef.Name)] = map[string]any{
-			"rates": si.rates,
-			"when": []any{
-				map[string]any{
-					// Exempt /v1/models endpoint from token rate limiting.
-					// This endpoint is used for model discovery/metadata and does not consume inference tokens.
-					// Users should be able to query model capabilities even when their token quota is exhausted.
-					"predicate": fmt.Sprintf(`auth.identity.selected_subscription_key == "%s" && !request.path.endsWith("/v1/models")`, modelScopedRef),
-				},
-			},
-			"counters": []any{
-				map[string]any{"expression": "auth.identity.userid"},
-			},
-		}
-	}
-
-	// Sort subscription names for stable annotation value across reconciles
-	sort.Strings(subNames)
+	//
+	// Subscriptions sharing identical rates share one limit instead of one each, so the TRLP
+	// (and the EnvoyFilter/WasmPlugin Kuadrant renders from it, which repeats every limit per
+	// route match) grows with the number of distinct rate sets, not with the number of
+	// subscriptions behind them (RHOAIENG-95277). The predicate lists every subscription in
+	// the group; counters key on selected_subscription_key as well as userid so subscriptions
+	// sharing a limit still get independent budgets. Unlimited subscriptions share the
+	// rate-less unlimitedLimitName limit the same way. See buildGroupedLimits.
+	limitsMap, subNames := buildGroupedLimits(subs)
 
 	// Build the aggregated TokenRateLimitPolicy (one per model, covering all subscriptions)
 	// policyName already declared during early opt-out check
@@ -934,7 +962,7 @@ func (r *MaaSSubscriptionReconciler) updateStatus(ctx context.Context, subscript
 
 	statusTarget.Status = subscription.Status
 	if err := r.Status().Update(ctx, statusTarget); err != nil {
-		log := logr.FromContextOrDiscard(ctx)
+		log := oteljson.FromContext(ctx)
 		log.Error(err, "failed to update MaaSSubscription status", "name", subscription.Name)
 	}
 }
@@ -942,7 +970,7 @@ func (r *MaaSSubscriptionReconciler) updateStatus(ctx context.Context, subscript
 // scanForDuplicatePriority lists live MaaSSubscriptions and sets SpecPriorityDuplicate
 // on each. Triggered on create, delete, or when spec.priority changes (see SetupWithManager).
 func (r *MaaSSubscriptionReconciler) scanForDuplicatePriority(ctx context.Context) {
-	log := logr.FromContextOrDiscard(ctx).WithName("MaaSSubscriptionDuplicatePriority")
+	log := oteljson.FromContext(ctx).WithName("MaaSSubscriptionDuplicatePriority")
 	var list maasv1alpha1.MaaSSubscriptionList
 	if err := r.List(ctx, &list); err != nil {
 		log.Error(err, "failed to list MaaSSubscriptions for duplicate priority scan")
@@ -1174,7 +1202,7 @@ func (r *MaaSSubscriptionReconciler) mapAITenantToMaaSSubscriptions(ctx context.
 	tenantNamespace := tenantreconcile.TenantNamespaceForAITenant(aitenant.Name, r.DefaultTenantNamespace)
 	subList := &maasv1alpha1.MaaSSubscriptionList{}
 	if err := r.List(ctx, subList, client.InNamespace(tenantNamespace)); err != nil {
-		ctrl.LoggerFrom(ctx).Error(err, "failed to list MaaSSubscription resources for AITenant change",
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSSubscription resources for AITenant change",
 			"tenantNamespace", tenantNamespace,
 			"aitenant", obj.GetNamespace()+"/"+obj.GetName())
 		return nil
@@ -1228,7 +1256,7 @@ func (r *MaaSSubscriptionReconciler) mapNamespaceToMaaSSubscriptions(ctx context
 	}
 	subList := &maasv1alpha1.MaaSSubscriptionList{}
 	if err := r.List(ctx, subList, client.InNamespace(ns)); err != nil {
-		ctrl.LoggerFrom(ctx).Error(err, "failed to list MaaSSubscription for namespace label change", "namespace", ns)
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSSubscription for namespace label change", "namespace", ns)
 		return nil
 	}
 	requests := make([]reconcile.Request, len(subList.Items))

@@ -25,6 +25,11 @@ const (
 	ConfigKind = "Config"
 	// ConfigInstanceName is the singleton resource name enforced by the API.
 	ConfigInstanceName = "default"
+
+	// ConfigConditionTenantsHealthy is the condition type set on Config.Status
+	// to report the aggregate health of all AITenant CRs across the cluster.
+	// It follows the ADR ODH-ADR-MS-0003 three-state model (Healthy/Degraded/Blocked).
+	ConfigConditionTenantsHealthy = "TenantsHealthy"
 )
 
 // +kubebuilder:object:root=true
@@ -60,9 +65,8 @@ type ConfigSpec struct {
 	// for usage tracking (token counts, identity, model). When enabled, the
 	// controller deploys an EnvoyFilter on the shared gateway that emits
 	// structured usage logs via OTel Access Log Service.
-	// Enabling this logs identity attributes (user_id, key_id, key_name,
-	// organization_id, groups, subscription) per request — ensure
-	// GDPR/privacy compliance before enabling.
+	// Enabling this logs identity attributes (user_id, key_name, groups,
+	// subscription) per request — ensure GDPR/privacy compliance before enabling.
 	// +kubebuilder:default=false
 	// +kubebuilder:validation:Optional
 	UsageLogging *bool `json:"usageLogging,omitempty"`
@@ -74,6 +78,8 @@ type ConfigStatus struct {
 	// The Ready condition aggregates status from the default AITenant and MaasTenantConfig
 	// so that the platform operator (DSC) can report configuration issues without watching
 	// MaaS operands directly.
+	// The TenantsHealthy condition aggregates the Ready state of all AITenant CRs into a
+	// three-state model (Healthy/Degraded/Blocked) per ADR ODH-ADR-MS-0003.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

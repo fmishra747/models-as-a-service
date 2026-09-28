@@ -32,6 +32,35 @@ const (
 	// Deprecated: prefer spec.payloadProcessing.replicas on MaasTenantConfig/Tenant.
 	AnnotationPayloadProcessingReplicas = "maas.opendatahub.io/payload-processing-replicas"
 
+	// AnnotationPayloadProcessingStatus coordinates the payload-processing backend
+	// swap handshake between maas-controller (legacy IPP) and ai-gateway-controller
+	// (praxis). It lives only on MaasTenantConfig — never mirrored to/from AITenant.
+	//
+	// From maas-controller's perspective only two values matter:
+	//   - PayloadProcessingStatusCleanupComplete ("cleanup-complete"): clear to claim.
+	//     When legacy is selected, CAS-claim by deleting the annotation (back to absent)
+	//     then deploy. When praxis is selected (SkipIPP), this means we already finished
+	//     IPP cleanup and must not re-run it.
+	//   - absent: legacy owns / may deploy when legacy is selected (existing tenants are
+	//     assumed to run legacy IPP). When praxis is selected, absent means we still need
+	//     to clean up legacy IPP and then write cleanup-complete.
+	//   - any other value (e.g. praxis's own claim sentinel): not our turn — wait when
+	//     legacy is selected; do not overwrite when SkipIPP. maas-controller does not
+	//     interpret peer-specific values.
+	//
+	// Every new MaasTenantConfig is seeded with cleanup-complete at creation time
+	// (see AITenantReconciler.ensureTenantConfig's mutateCreate hook) so a brand-new
+	// tenant's first-ever deploy is never blocked by absent.
+	//
+	// The switch-off party deletes its bundle first, then sets cleanup-complete only
+	// after full cleanup success. Transitioning-in parties claim via optimistic-
+	// concurrency Update (resourceVersion-checked), not a blind merge-patch.
+	AnnotationPayloadProcessingStatus = "maas.opendatahub.io/payload-processing-status"
+
+	// PayloadProcessingStatusCleanupComplete means peer cleanup finished; the
+	// selected party may claim.
+	PayloadProcessingStatusCleanupComplete = "cleanup-complete"
+
 	// ComponentName is the ODH component label key suffix (app.opendatahub.io/<name>).
 	// This is the DSC component identifier, not a standalone CR kind.
 	ComponentName = "modelsasservice"
@@ -100,6 +129,7 @@ const (
 	baseMaaSAPIServiceName                         = "maas-api"
 	baseMaaSAPIKeyCleanupScriptConfigMapName       = "maas-api-key-cleanup-script" //nolint:gosec // Kubernetes resource name, not a credential
 	baseMaaSAPIDeploymentNSNetworkPolicyName       = "maas-api-allow-deployment-ns"
+	baseMaaSAPIEgressRestrictNetworkPolicyName     = "maas-api-egress-restrict"
 	baseMaaSAPIServingCertName                     = "maas-api-serving-cert"
 	baseUsageLogsEnvoyFilterName                   = "maas-model-access-logs"
 
@@ -264,6 +294,26 @@ func PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID string) str
 
 func UsageLogsEnvoyFilterName(tenantID string) string {
 	return resourceNameForTenant(baseUsageLogsEnvoyFilterName, tenantID)
+}
+
+// isIPPResource reports whether a kustomize base resource belongs to the IPP stack.
+func isIPPResource(gvk schema.GroupVersionKind, name string) bool {
+	switch {
+	case (gvk == GVKDeployment || gvk == GVKService || gvk == GVKDestinationRule) &&
+		(name == PayloadProcessingName || name == PayloadPreProcessingName):
+		return true
+	case gvk == GVKEnvoyFilter && name == PayloadProcessingName:
+		return true
+	case gvk == GVKServiceAccount && name == PayloadProcessingName:
+		return true
+	case gvk == GVKConfigMap && name == PayloadProcessingPluginsConfigMapName:
+		return true
+	case gvk == GVKNetworkPolicy && name == PayloadProcessingName:
+		return true
+	case gvk == GVKClusterRoleBinding && name == PayloadProcessingReaderClusterRoleBindingName:
+		return true
+	}
+	return false
 }
 
 // TenantIdentifierFor extracts the tenant identifier from a tenant config object.

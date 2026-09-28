@@ -17,6 +17,15 @@ const (
 	// AnnotationAITenantNamespace identifies the namespace of the owning AITenant.
 	AnnotationAITenantNamespace = "maas.opendatahub.io/aitenant-namespace"
 
+	// AnnotationPayloadProcessingType selects the tenant payload-processing dataplane.
+	// Value "praxis" skips legacy IPP reconciliation in maas-controller; absent or other values
+	// mean legacy IPP.
+	AnnotationPayloadProcessingType = "maas.opendatahub.io/payload-processing-type"
+
+	// PayloadProcessingTypePraxis is the annotation value that opts a tenant into the
+	// ai-gateway-controller praxis dataplane and skips maas-controller IPP resources.
+	PayloadProcessingTypePraxis = "praxis"
+
 	tenantNamespacePrefix = "ai-tenant-"
 )
 
@@ -24,10 +33,10 @@ const (
 // and reconciling tenant infrastructure. AITenant-managed tenants receive these
 // values from AITenant; legacy tenants receive them from Tenant spec/defaults.
 type PlatformContext struct {
-	GatewayRef               maasv1alpha1.TenantGatewayRef
-	ExternalOIDC             *maasv1alpha1.TenantExternalOIDCConfig
-	PayloadProcessingBackend string
-	Source                   string
+	GatewayRef   maasv1alpha1.TenantGatewayRef
+	ExternalOIDC *maasv1alpha1.TenantExternalOIDCConfig
+	SkipIPP      bool
+	Source       string
 }
 
 // ResolvePlatformContext resolves gateway and OIDC values for a tenant config object.
@@ -38,9 +47,8 @@ type PlatformContext struct {
 func ResolvePlatformContext(ctx context.Context, c client.Reader, tenant client.Object, fallbackGatewayRef maasv1alpha1.TenantGatewayRef) (PlatformContext, error) {
 	if tenant == nil {
 		return PlatformContext{
-			GatewayRef:               fallbackGatewayRef,
-			PayloadProcessingBackend: maasv1alpha1.PayloadProcessingBackendIPP,
-			Source:                   "default",
+			GatewayRef: fallbackGatewayRef,
+			Source:     "default",
 		}, nil
 	}
 
@@ -58,17 +66,15 @@ func ResolvePlatformContext(ctx context.Context, c client.Reader, tenant client.
 		}
 
 		return PlatformContext{
-			GatewayRef:               ref,
-			ExternalOIDC:             legacy.Spec.ExternalOIDC.DeepCopy(),
-			PayloadProcessingBackend: maasv1alpha1.PayloadProcessingBackendIPP,
-			Source:                   "legacy-tenant-spec",
+			GatewayRef:   ref,
+			ExternalOIDC: legacy.Spec.ExternalOIDC.DeepCopy(),
+			Source:       "legacy-tenant-spec",
 		}, nil
 	}
 
 	return PlatformContext{
-		GatewayRef:               fallbackGatewayRef,
-		PayloadProcessingBackend: maasv1alpha1.PayloadProcessingBackendIPP,
-		Source:                   "tenant-config",
+		GatewayRef: fallbackGatewayRef,
+		Source:     "tenant-config",
 	}, nil
 }
 
@@ -99,11 +105,15 @@ func resolveAITenantPlatformContext(ctx context.Context, c client.Reader, tenant
 	}
 
 	return PlatformContext{
-		GatewayRef:               ref,
-		ExternalOIDC:             aitenant.Spec.OIDC.DeepCopy(),
-		PayloadProcessingBackend: maasv1alpha1.EffectivePayloadProcessingBackend(aitenant.Spec),
-		Source:                   "aitenant",
+		GatewayRef:   ref,
+		ExternalOIDC: aitenant.Spec.OIDC.DeepCopy(),
+		SkipIPP:      resolveSkipIPP(tenant),
+		Source:       "aitenant",
 	}, nil
+}
+
+func resolveSkipIPP(tenant client.Object) bool {
+	return annotationValue(tenant, AnnotationPayloadProcessingType) == PayloadProcessingTypePraxis
 }
 
 func isAITenantManagedTenantConfig(tenant client.Object) bool {
