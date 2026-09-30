@@ -87,12 +87,29 @@ Enables Authorino to make HTTPS calls to `maas-api` for API key validation and m
 # Configure SSL environment variables for outbound HTTPS
 # Note: The Authorino CR doesn't support envVars, so we patch the deployment directly
 kubectl -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+  SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
+  REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 ```
 
 !!! note
-    OpenShift's service-ca-operator automatically populates the ConfigMap with the cluster CA certificate.
+    OpenShift projects the `openshift-service-ca.crt` ConfigMap, which service-ca-operator
+    populates with the service CA bundle, into every pod's service account volume at
+    `/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`. This is the bundle that
+    signs the `maas-api` serving certificate, and it requires no extra volume mount on the
+    Authorino deployment — which matters because authorino-operator manages that deployment
+    and reverts volumes added to it.
+
+!!! warning
+    Do not point these variables at `/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt`.
+    That path exists only in the `maas-api` pod, where the `tls` overlay mounts the ConfigMap
+    explicitly; nothing is mounted there in the Authorino pod.
+
+    This misconfiguration is easy to miss because it fails silently rather than loudly:
+    Authorino is written in Go, and Go's `crypto/x509` ignores an unreadable `SSL_CERT_FILE`
+    and falls back to the system trust store without raising an error. Authorino therefore
+    keeps running with no certificate errors in its logs, but the service CA is never
+    explicitly trusted — so the setting does nothing at all. Use the service account path
+    above to actually load the service CA bundle.
 
 ### Gateway → maas-api TLS (DestinationRule)
 
