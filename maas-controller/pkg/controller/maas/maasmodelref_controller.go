@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 
@@ -225,7 +226,12 @@ func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	governed := r.checkGovernanceAttached(ctx, model)
 	r.setGovernanceCondition(model, governed)
-	r.setRuntimeReadyCondition(model, runtimeReady)
+	if runtimeReady {
+		markRuntimeReady(model)
+	} else {
+		reason, message := handler.NotReadyReason()
+		markRuntimeNotReady(model, reason, message)
+	}
 	r.checkModelIdentityConflict(ctx, log, model)
 
 	phase, message := deriveModelPhase(governed, runtimeReady)
@@ -294,21 +300,28 @@ func (r *MaaSModelRefReconciler) setGovernanceCondition(model *maasv1alpha1.MaaS
 	apimeta.SetStatusCondition(&model.Status.Conditions, cond)
 }
 
-func (r *MaaSModelRefReconciler) setRuntimeReadyCondition(model *maasv1alpha1.MaaSModelRef, ready bool) {
-	cond := metav1.Condition{
+// markRuntimeReady records a healthy backend on RuntimeReady.
+func markRuntimeReady(model *maasv1alpha1.MaaSModelRef) {
+	setRuntimeReadyCondition(model, metav1.ConditionTrue, maasv1alpha1.ReasonRuntimeHealthy, "Backend is healthy")
+}
+
+// markRuntimeNotReady records why the backend is not ready on RuntimeReady; an empty
+// reason keeps the generic one.
+func markRuntimeNotReady(model *maasv1alpha1.MaaSModelRef, reason maasv1alpha1.ConditionReason, message string) {
+	if reason == "" {
+		reason, message = maasv1alpha1.ReasonRuntimeHealthFailure, "Backend is not ready"
+	}
+	setRuntimeReadyCondition(model, metav1.ConditionFalse, reason, message)
+}
+
+func setRuntimeReadyCondition(model *maasv1alpha1.MaaSModelRef, status metav1.ConditionStatus, reason maasv1alpha1.ConditionReason, message string) {
+	apimeta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               maasv1alpha1.ConditionRuntimeReady,
+		Status:             status,
+		Reason:             string(reason),
+		Message:            message,
 		ObservedGeneration: model.GetGeneration(),
-	}
-	if ready {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = string(maasv1alpha1.ReasonRuntimeHealthy)
-		cond.Message = "Backend is healthy"
-	} else {
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = string(maasv1alpha1.ReasonRuntimeHealthFailure)
-		cond.Message = "Backend is not ready"
-	}
-	apimeta.SetStatusCondition(&model.Status.Conditions, cond)
+	})
 }
 
 func deriveModelPhase(governed, runtimeReady bool) (phase, message string) {
@@ -551,7 +564,7 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// (fixes race condition where MaaSModelRef is created before HTTPRoute exists).
 		Watches(&gatewayapiv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(
 			r.mapHTTPRouteToMaaSModelRefs,
-		)).
+		), builder.WithPredicates(httpRouteChangedForModelRef())).
 		// Watch sibling MaaSModelRefs so model-identity-conflict detection stays
 		// current: a newly created/deleted sibling, or one whose resolved alias
 		// changed, can introduce or resolve a conflict for every other model in
@@ -591,6 +604,15 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		)
 	} else {
 		ctrl.Log.Info("LLMInferenceService CRD not yet registered; watch will be added dynamically when KServe is ready")
+	}
+
+	// Watch inference ExternalModels: their reconciler can record status.httpRouteName
+	// after the route it names already exists and is accepted, and the HTTPRoute watch
+	// has nothing left to deliver by then.
+	const ippExternalModelCRD = "externalmodels.inference.opendatahub.io"
+	ippExternalModelExists := crdExists(ctx, mgr.GetAPIReader(), ippExternalModelCRD)
+	if ippExternalModelExists {
+		b = b.WatchesRawSource(r.ippExternalModelSource(mgr))
 	}
 
 	c, err := b.
@@ -657,7 +679,77 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return fmt.Errorf("failed to register CRD watcher for LLMInferenceService: %w", err)
 		}
 	}
+	if !ippExternalModelExists {
+		if err := registerWatchWhenCRDAppears(c, mgr, ippExternalModelCRD, func() source.Source {
+			return r.ippExternalModelSource(mgr)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for inference ExternalModel: %w", err)
+		}
+	}
 	return nil
+}
+
+// httpRouteChangedForModelRef drops HTTPRoute status writes that MaaSModelRef reconcile
+// does not read: Kuadrant policy-affected conditions, and gateway rewrites of ResolvedRefs,
+// observedGeneration or lastTransitionTime. The reconcile reads the route name, labels
+// (llmisvc route lookup), spec.parentRefs and spec.hostnames, and for ExternalModel
+// the set of parents reporting Accepted=True and the reason and message of gateways
+// rejecting the route.
+func httpRouteChangedForModelRef() predicate.Predicate { //nolint:ireturn // builder.WithPredicates takes predicate.Predicate.
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.LabelChangedPredicate{},
+		predicate.Funcs{UpdateFunc: uidChanged},
+		predicate.Funcs{UpdateFunc: routeAcceptedParentsChanged},
+		predicate.Funcs{UpdateFunc: routeRejectionsChanged},
+	)
+}
+
+func routeAcceptedParentsChanged(e event.UpdateEvent) bool {
+	oldRoute, okOld := e.ObjectOld.(*gatewayapiv1.HTTPRoute)
+	newRoute, okNew := e.ObjectNew.(*gatewayapiv1.HTTPRoute)
+	if !okOld || !okNew {
+		return true
+	}
+	return !acceptedRouteParents(oldRoute).Equal(acceptedRouteParents(newRoute))
+}
+
+func routeRejectionsChanged(e event.UpdateEvent) bool {
+	oldRoute, okOld := e.ObjectOld.(*gatewayapiv1.HTTPRoute)
+	newRoute, okNew := e.ObjectNew.(*gatewayapiv1.HTTPRoute)
+	if !okOld || !okNew {
+		return true
+	}
+	return !maps.Equal(routeRejections(oldRoute), routeRejections(newRoute))
+}
+
+// ippExternalModelChangedForModelRef drops inference ExternalModel status writes other
+// than status.httpRouteName, the only ExternalModel status MaaSModelRef reconcile reads.
+func ippExternalModelChangedForModelRef() predicate.Predicate { //nolint:ireturn // source.Kind takes predicate.Predicate.
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.Funcs{UpdateFunc: ippExternalModelRouteNameChanged},
+	)
+}
+
+func ippExternalModelRouteNameChanged(e event.UpdateEvent) bool {
+	oldEM, okOld := e.ObjectOld.(*unstructured.Unstructured)
+	newEM, okNew := e.ObjectNew.(*unstructured.Unstructured)
+	if !okOld || !okNew {
+		return true
+	}
+	return ippExternalModelRouteName(oldEM) != ippExternalModelRouteName(newEM)
+}
+
+// ippExternalModelSource watches inference ExternalModels as unstructured: the type is
+// not in the scheme, and the CRD may be installed after startup.
+func (r *MaaSModelRefReconciler) ippExternalModelSource(mgr ctrl.Manager) source.Source { //nolint:ireturn // registerWatchWhenCRDAppears takes source.Source.
+	em := &unstructured.Unstructured{}
+	em.SetGroupVersionKind(inferenceExternalModelGVK)
+	return source.Kind[client.Object](mgr.GetCache(), em,
+		handler.EnqueueRequestsFromMapFunc(r.mapIPPExternalModelToMaaSModelRefs),
+		ippExternalModelChangedForModelRef(),
+	)
 }
 
 // mapHTTPRouteToMaaSModelRefs returns reconcile requests for all MaaSModelRefs in the HTTPRoute's namespace.
@@ -805,15 +897,26 @@ func (r *MaaSModelRefReconciler) mapLLMISvcToMaaSModelRefs(ctx context.Context, 
 	// Use GetName/GetNamespace — works for both typed *kservev1alpha2.LLMInferenceService
 	// (static watch at startup) and *unstructured.Unstructured (dynamic watch registered
 	// via registerWatchWhenCRDAppears when KServe CRD appears after startup).
+	return r.modelRefsReferencing(ctx, "LLMInferenceService", obj)
+}
+
+// mapIPPExternalModelToMaaSModelRefs returns reconcile requests for all MaaSModelRefs
+// that reference the given inference ExternalModel by name in the same namespace.
+func (r *MaaSModelRefReconciler) mapIPPExternalModelToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.modelRefsReferencing(ctx, "ExternalModel", obj)
+}
+
+// modelRefsReferencing returns reconcile requests for the MaaSModelRefs in obj's
+// namespace whose spec.modelRef names obj with the given kind.
+func (r *MaaSModelRefReconciler) modelRefsReferencing(ctx context.Context, kind string, obj client.Object) []reconcile.Request {
 	var models maasv1alpha1.MaaSModelRefList
 	if err := r.List(ctx, &models, client.MatchingFields{modelRefNameIndex: obj.GetName()}); err != nil {
-		oteljson.FromContext(ctx).Error(err, "failed to list MaaSModels by modelRef.name index", "llmisvcName", obj.GetName())
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSModels by modelRef.name index", "kind", kind, "name", obj.GetName())
 		return nil
 	}
 	var requests []reconcile.Request
 	for _, m := range models.Items {
-		kind := m.Spec.ModelRef.Kind
-		if kind != "LLMInferenceService" {
+		if m.Spec.ModelRef.Kind != kind {
 			continue
 		}
 		// MaaSModelRef references models in the same namespace
