@@ -852,6 +852,9 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, 
 					map[string]any{
 						"predicate": `!("x-maas-keyname" in request.headers)`,
 					},
+					map[string]any{
+						"predicate": `!("x-maas-subscription-rate-limit-id" in request.headers)`,
+					},
 				},
 			},
 		},
@@ -1094,6 +1097,20 @@ allow {
 						"metrics":  false,
 						"priority": int64(0),
 					},
+					// Short rate-limit identity for TokenRateLimitPolicy (does not replace
+					// X-MaaS-Subscription). Populated from maas-api subscription select.
+					"X-MaaS-Subscription-Rate-Limit-Id": map[string]any{
+						"when": []any{
+							map[string]any{
+								"predicate": `has(auth.metadata["subscription-info"].rateLimitId) && auth.metadata["subscription-info"].rateLimitId != ""`,
+							},
+						},
+						"plain": map[string]any{
+							"expression": `auth.metadata["subscription-info"].rateLimitId`,
+						},
+						"metrics":  false,
+						"priority": int64(0),
+					},
 					"X-MaaS-KeyName": map[string]any{
 						"when": []any{
 							map[string]any{
@@ -1110,6 +1127,14 @@ allow {
 				},
 				"filters": map[string]any{
 					"identity": map[string]any{
+						// Same guard as subscription-info. Without it the filter fails on
+						// /maas-api requests, and Authorino cancels the other priority-0
+						// response configs, dropping X-MaaS-* headers at random.
+						"when": []any{
+							map[string]any{
+								"predicate": celModelIdentityAvailable,
+							},
+						},
 						"json": map[string]any{
 							"properties": map[string]any{
 								"groups":     map[string]any{"expression": celGroups},
@@ -1128,8 +1153,8 @@ allow {
 								},
 								// Model-scoped subscription key: namespace/name@modelIdentity
 								// Prefer resolvedModel from subscription-info (MaaSModelRef
-								// namespace/name after BBR alias resolution) so TRLP when
-								// predicates match for both path and body-based routing.
+								// namespace/name after BBR alias resolution). Kept for telemetry
+								// and debugging; TRLP when-predicates match selected_subscription_id.
 								"selected_subscription_key": map[string]any{
 									"expression": fmt.Sprintf(
 										`(has(auth.metadata["subscription-info"].namespace) && `+
@@ -1138,6 +1163,12 @@ allow {
 											`+ auth.metadata["subscription-info"].name + "@" + %s : ""`,
 										celResolvedModelIdentity,
 									),
+								},
+								// Short hash of selected_subscription_key from maas-api
+								// (subscription-info.rateLimitId). TokenRateLimitPolicy when
+								// predicates match this field to keep the WASM shim compact.
+								"selected_subscription_id": map[string]any{
+									"expression": `has(auth.metadata["subscription-info"].rateLimitId) ? auth.metadata["subscription-info"].rateLimitId : ""`,
 								},
 								"subscription_info": map[string]any{
 									"expression": `has(auth.metadata["subscription-info"].name) ? auth.metadata["subscription-info"] : {}`,
