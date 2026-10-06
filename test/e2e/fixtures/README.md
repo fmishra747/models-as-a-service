@@ -34,6 +34,25 @@ shared `random` simulators used by every other test are untouched.
 Like `distinct` and `distinct-2`, the fixture ships only an LLMIS and a
 MaaSModelRef — tests create their own MaaSSubscription and MaaSAuthPolicy.
 
+Behaviour verified against `llm-d-inference-sim:v0.8.2`, worth knowing before
+writing tests against it:
+
+| Behaviour | Result |
+|---|---|
+| Response content | Mirrors the request verbatim, byte for byte |
+| Response size | Tracks request size (432KB request produced a 432KB response) |
+| `max_tokens` | Does **not** truncate the echo — a 50-token cap still returned the full payload |
+| Context window | Rejects anything over `--max-model-len` with HTTP 400, hence the 131072 above |
+| Reported `usage` | Counts whitespace-delimited words, not bytes — `'A' * 200000` reported 6 prompt tokens |
+| Peak memory | ~130Mi at the largest payload the context window allows |
+
+The `usage` caveat matters: token counts are not proportional to payload size,
+so do not use this fixture to assert token accounting or rate-limit maths. Use
+the `random`-mode simulators for that.
+
+Concurrency is capped by the simulator's `--max-num-seqs` (default 5). Raise it
+in the LLMIS args if a test needs more requests in flight at once.
+
 > [!NOTE]
 > An overlay adding `--log-http` is deliberately **not** included. That flag makes
 > the simulator log full HTTP requests and responses, including `Authorization`

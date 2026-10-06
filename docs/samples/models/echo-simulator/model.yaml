@@ -36,6 +36,13 @@ spec:
         # response, logs and metrics (leak tests).
         - --mode
         - echo
+        # The simulator's context window defaults to 1024 tokens and it rejects
+        # anything larger with a 400, which would cap this fixture well below the
+        # payload sizes it exists to exercise. 131072 allows roughly 430KB of
+        # prose per request; measured peak RSS at that size is ~130Mi, so it stays
+        # comfortably inside the 512Mi limit below.
+        - --max-model-len
+        - "131072"
         - --no-mm-encoder-only
         - --ssl-certfile
         - /var/run/kserve/tls/tls.crt
