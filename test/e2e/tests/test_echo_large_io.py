@@ -63,6 +63,11 @@ pytestmark = [pytest.mark.xdist_group("echo_io"), pytest.mark.serial]
 # crosses on its way through the gateway.
 LARGE_WORDS = 20000
 
+# The module sends a handful of LARGE_WORDS round trips, each billing ~40k
+# tokens (prompt plus mirrored completion). Ten million per minute keeps rate
+# limiting out of the way without relying on the newer unlimited field.
+TOKEN_BUDGET = 10_000_000
+
 
 def _lorem(words: int) -> str:
     """Whitespace-delimited filler, so the simulator's tokenizer sees real words."""
@@ -107,27 +112,35 @@ def echo_access():
     oc_token = _create_sa_token(sa_name, namespace=MODEL_NAMESPACE)
     sa_user = _sa_to_user(sa_name, namespace=MODEL_NAMESPACE)
 
-    _create_test_auth_policy(auth_name, ECHO_MODEL_REF, users=[sa_user])
-    # Large echoes return many tokens; a small budget would turn these into 429s
-    # before the body assertions ever run.
-    _create_test_subscription(
-        subscription_name,
-        ECHO_MODEL_REF,
-        users=[sa_user],
-        unlimited=True,
-    )
-
-    # The MaaSModelRef ships Pending: it holds at
-    # "GovernanceAttached=False NoPairingFound" until a subscription and auth
-    # policy pair exists, and only then publishes its endpoint. Without this
-    # wait the first request can race the route and fail as a 404 or 403 that
-    # looks like a product bug rather than a fixture that is not up yet.
-    _wait_for_model_ready(ECHO_MODEL_REF, namespace=MODEL_NAMESPACE, timeout=120)
-    _wait_for_gateway_auth_enforced()
-
-    api_key = _create_api_key(oc_token, subscription=subscription_name)
+    # Everything from the first CR onward sits inside the try: if setup fails
+    # partway -- an invalid subscription, a pairing that never goes Ready -- the
+    # yield never happens, so without this the already-created auth policy would
+    # leak onto the cluster and the next run would inherit it.
     try:
-        yield api_key
+        _create_test_auth_policy(auth_name, ECHO_MODEL_REF, users=[sa_user])
+        # A large echo bills roughly one token per whitespace-delimited word in
+        # both directions, so LARGE_WORDS costs ~40k tokens per request and the
+        # default budget would turn these into 429s before the body assertions
+        # ever run. An explicit ceiling rather than unlimited=True: the unlimited
+        # field is a newer addition and clusters whose CRD predates it reject the
+        # subscription with "spec.modelRefs[0].tokenRateLimits: Required value".
+        _create_test_subscription(
+            subscription_name,
+            ECHO_MODEL_REF,
+            users=[sa_user],
+            token_limit=TOKEN_BUDGET,
+            window="1m",
+        )
+
+        # The MaaSModelRef ships Pending: it holds at
+        # "GovernanceAttached=False NoPairingFound" until a subscription and auth
+        # policy pair exists, and only then publishes its endpoint. Without this
+        # wait the first request can race the route and fail as a 404 or 403 that
+        # looks like a product bug rather than a fixture that is not up yet.
+        _wait_for_model_ready(ECHO_MODEL_REF, namespace=MODEL_NAMESPACE, timeout=120)
+        _wait_for_gateway_auth_enforced()
+
+        yield _create_api_key(oc_token, subscription=subscription_name)
     finally:
         _delete_governance_and_wait(
             subscriptions=[(subscription_name, ns)],
