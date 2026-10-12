@@ -48,6 +48,7 @@ from test_helper import (
     _ns,
     _sa_to_user,
     _wait_for_gateway_auth_enforced,
+    _wait_for_model_ready,
 )
 
 log = logging.getLogger(__name__)
@@ -115,6 +116,13 @@ def echo_access():
         users=[sa_user],
         unlimited=True,
     )
+
+    # The MaaSModelRef ships Pending: it holds at
+    # "GovernanceAttached=False NoPairingFound" until a subscription and auth
+    # policy pair exists, and only then publishes its endpoint. Without this
+    # wait the first request can race the route and fail as a 404 or 403 that
+    # looks like a product bug rather than a fixture that is not up yet.
+    _wait_for_model_ready(ECHO_MODEL_REF, namespace=MODEL_NAMESPACE, timeout=120)
     _wait_for_gateway_auth_enforced()
 
     api_key = _create_api_key(oc_token, subscription=subscription_name)
