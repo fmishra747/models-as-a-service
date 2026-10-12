@@ -49,6 +49,7 @@ from test_helper import (
     _sa_to_user,
     _wait_for_gateway_auth_enforced,
     _wait_for_model_ready,
+    _wait_for_subscription_inference_ready,
 )
 
 log = logging.getLogger(__name__)
@@ -139,6 +140,19 @@ def echo_access():
         # looks like a product bug rather than a fixture that is not up yet.
         _wait_for_model_ready(ECHO_MODEL_REF, namespace=MODEL_NAMESPACE, timeout=120)
         _wait_for_gateway_auth_enforced()
+
+        # A Ready model and an enforced gateway AuthPolicy are not sufficient:
+        # the TokenRateLimitPolicy derived from this subscription reconciles
+        # separately, and until it does the gateway rejects every request with
+        # 403 "subscription rate limiting policies are not ready". This waits on
+        # discovery, the TRLP itself, and the subscription's TRLP status.
+        _wait_for_subscription_inference_ready(
+            subscription_name,
+            ECHO_MODEL_REF,
+            namespace=ns,
+            model_namespace=MODEL_NAMESPACE,
+            timeout=180,
+        )
 
         yield _create_api_key(oc_token, subscription=subscription_name)
     finally:
