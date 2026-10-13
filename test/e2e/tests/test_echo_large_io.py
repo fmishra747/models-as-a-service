@@ -98,6 +98,18 @@ def _content(response: requests.Response) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
+def _detail(response: requests.Response, api_key: str) -> str:
+    """Assertion message carrying the response body with the API key redacted.
+
+    The body is worth keeping -- gateway errors like "subscription rate limiting
+    policies are not ready" are what make a failure diagnosable. But these tests
+    exist precisely because a response might reflect the credential, and an
+    assertion message lands in pytest output and CI logs (CWE-532), so the key is
+    stripped before it gets there.
+    """
+    return f"HTTP {response.status_code}: {response.text[:300].replace(api_key, '<redacted>')}"
+
+
 @pytest.fixture(scope="module")
 def echo_access():
     """Grant a service account access to the echo model and mint it an API key.
@@ -170,14 +182,14 @@ class TestEchoFidelity:
         """A small prompt comes back verbatim, proving the fixture is in echo mode."""
         prompt = f"echo-fidelity-{uuid.uuid4()}"
         r = _echo_completion(echo_access, prompt)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 200, _detail(r, echo_access)
         assert _content(r) == prompt
 
     def test_max_tokens_does_not_truncate(self, echo_access):
         """max_tokens must not clip the echo, or large-I/O assertions are meaningless."""
         prompt = _lorem(500)
         r = _echo_completion(echo_access, prompt, max_tokens=1)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 200, _detail(r, echo_access)
         assert _content(r) == prompt
 
 
@@ -191,7 +203,7 @@ class TestLargeIO:
         log.info(f"Sending {len(prompt)} byte prompt to {ECHO_MODEL_PATH}")
 
         r = _echo_completion(echo_access, prompt)
-        assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+        assert r.status_code == 200, _detail(r, echo_access)
 
         content = _content(r)
         assert len(content) == len(prompt), (
@@ -209,9 +221,9 @@ class TestLargeIO:
         large = _lorem(LARGE_WORDS)
 
         r_small = _echo_completion(echo_access, small)
-        assert r_small.status_code == 200, r_small.text
+        assert r_small.status_code == 200, _detail(r_small, echo_access)
         r_large = _echo_completion(echo_access, large)
-        assert r_large.status_code == 200, r_large.text
+        assert r_large.status_code == 200, _detail(r_large, echo_access)
 
         assert len(_content(r_small)) == len(small)
         assert len(_content(r_large)) == len(large)
@@ -226,21 +238,31 @@ class TestCredentialLeak:
         """Echo mirrors the user message; it must never mirror the credential.
 
         If the gateway ever folded auth headers into the forwarded body, the
-        simulator would echo them straight back to the caller.
+        simulator would echo them straight back to the caller. Headers are
+        checked as well as the body: a key reflected into a response header
+        leaks just as badly and would otherwise slip past both of these tests,
+        since the canary test below only looks for its own prompt string.
         """
         prompt = f"leak-probe-{uuid.uuid4()}"
         r = _echo_completion(echo_access, prompt)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 200, _detail(r, echo_access)
 
         body = r.text
         assert echo_access not in body, "API key reflected in the response body"
         assert "Bearer " not in body, "Authorization header reflected in the response body"
 
+        leaked = [
+            name
+            for name, value in r.headers.items()
+            if echo_access in name or echo_access in value
+        ]
+        assert not leaked, f"API key reflected in response headers: {leaked}"
+
     def test_canary_in_prompt_is_not_leaked_to_headers(self, echo_access):
         """A canary in the body must stay in the body, not surface in response headers."""
         canary = f"CANARY-{uuid.uuid4()}"
         r = _echo_completion(echo_access, canary)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 200, _detail(r, echo_access)
 
         assert _content(r) == canary, "echo did not return the canary"
         leaked = [k for k, v in r.headers.items() if canary in v]
