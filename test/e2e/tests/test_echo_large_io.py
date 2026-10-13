@@ -16,7 +16,7 @@ classes rely on:
 * **Leaks** — a canary placed in the prompt comes back verbatim, so a test can
   assert exactly where it does and does not appear.
 
-Behaviour of ``llm-d-inference-sim:v0.8.2`` that shaped these tests:
+Behaviour of ``llm-d-inference-sim:v0.9.0`` that shaped these tests:
 
 * ``max_tokens`` does **not** truncate the echo; a small cap still returns the
   whole payload.

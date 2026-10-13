@@ -34,7 +34,7 @@ shared `random` simulators used by every other test are untouched.
 Like `distinct` and `distinct-2`, the fixture ships only an LLMIS and a
 MaaSModelRef — tests create their own MaaSSubscription and MaaSAuthPolicy.
 
-Behaviour verified against `llm-d-inference-sim:v0.8.2`, worth knowing before
+Behaviour verified against `llm-d-inference-sim:v0.9.0`, worth knowing before
 writing tests against it:
 
 | Behaviour | Result |
@@ -53,11 +53,31 @@ the `random`-mode simulators for that.
 Concurrency is capped by the simulator's `--max-num-seqs` (default 5). Raise it
 in the LLMIS args if a test needs more requests in flight at once.
 
-> [!NOTE]
-> An overlay adding `--log-http` is deliberately **not** included. That flag makes
-> the simulator log full HTTP requests and responses, including `Authorization`
-> headers and API keys, so it writes secrets to CI logs by design. It needs team
-> agreement before it goes anywhere near shared CI.
+#### echo-sim-log-http (opt-in, never in CI)
+
+`echo-sim-log-http` is the same model with `--log-http` appended, which makes the
+simulator log complete HTTP requests and responses — *"method, URI, headers,
+bodies when buffered, status; streamed bodies are not logged"*. It exists for
+investigating which credentials actually reach the backend.
+
+It is deliberately **absent** from `kustomization.yaml` above. `--log-http`
+records the `Authorization` header, so a single request puts a live API key in
+the pod log, and CI archives pod logs as artifacts. Apply it by hand and revert
+when done:
+
+```bash
+kustomize build test/e2e/fixtures/echo-sim-log-http | kubectl apply -f -
+# ... investigate ...
+kustomize build test/e2e/fixtures | kubectl apply -f -
+```
+
+Both render an LLMIS named `echo-simulator`, so they are mutually exclusive —
+applying one replaces the other, and you cannot end up with both by accident.
+
+> [!WARNING]
+> Do not add `echo-sim-log-http` to the fixtures kustomization or any CI path.
+> Note also that `test_api_key_not_echoed_in_response` still passes while this
+> overlay is active: it inspects the response, not the pod log.
 
 ## Usage
 
