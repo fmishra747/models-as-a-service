@@ -34,6 +34,22 @@ shared `random` simulators used by every other test are untouched.
 Like `distinct` and `distinct-2`, the fixture ships only an LLMIS and a
 MaaSModelRef — tests create their own MaaSSubscription and MaaSAuthPolicy.
 
+`echo-sim` is the only simulator on `llm-d-inference-sim:v0.9.0`; every other
+one is pinned to `v0.8.2`. The split is deliberate and should not be
+"tidied up" into a single version:
+
+- echo-sim needs v0.9.0 because the `echo-sim-log-http` overlay passes
+  `--log-http`, and v0.8.2 exits at startup with `unknown flag: --log-http`.
+- The others cannot move to v0.9.0. In v0.9.0 a model id that resolves on
+  HuggingFace is routed through the real HF tokenizer, and `--mode random`
+  then initializes its dataset through a render service on `localhost:8082`.
+  Nothing in these manifests runs one, so the container crash-loops with
+  `failed to initialize random dataset ... connection refused`. v0.9.0 logs
+  `Model is not a real HF model, using simulated tokenizer` for made-up ids,
+  so only `facebook/opt-125m` — the one real repo id in use — is affected.
+  There is no flag to opt out: `--render-url` only repoints the service.
+- echo mode never builds that dataset, so v0.9.0 is safe for this fixture.
+
 Behaviour verified against `llm-d-inference-sim:v0.9.0`, worth knowing before
 writing tests against it:
 
