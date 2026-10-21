@@ -154,6 +154,7 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | maxExpirationDays | int32 | No | Maximum number of days an API key can be valid. Must be at least 1. |
+| deletionRetentionDays | int32 | No | Number of days lifecycle-invalidated API keys remain soft-deleted for audit before physical deletion. Defaults to 90; must be at least 1. |
 
 ---
 
@@ -181,6 +182,7 @@ spec:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | captureUser | bool | No | `false` | Include the authenticated user ID as `user_id` on usage logs. Independent of `metrics.captureUser`. May have privacy implications; ensure compliance before enabling. |
+| captureOrganization | bool | No | `true` | Include the subscription organization ID as `organization_id` on usage logs. Independent of `metrics.captureOrganization`. |
 
 ---
 
@@ -235,6 +237,7 @@ metadata:
 spec:
   apiKeys:
     maxExpirationDays: 90
+    deletionRetentionDays: 90
 ```
 
 ### Example: Autoscaling Payload Processing
@@ -284,6 +287,7 @@ spec:
       captureModelUsage: true
     logs:
       captureUser: false
+      captureOrganization: true
 ```
 
 ---

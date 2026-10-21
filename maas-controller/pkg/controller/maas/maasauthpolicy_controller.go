@@ -36,7 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -53,6 +53,8 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/authpolicy"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/groupname"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
@@ -89,7 +91,7 @@ type MaaSAuthPolicyReconciler struct {
 	AuthzCacheTTL int64
 
 	// Recorder emits Kubernetes events for conflict detection warnings.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run.
 	// Defaults to 1 if not set.
 	MaxConcurrentReconciles int
@@ -101,9 +103,12 @@ type MaaSAuthPolicyReconciler struct {
 
 // oidcConfig holds resolved OIDC configuration from AITenant or a legacy Tenant CR.
 type oidcConfig struct {
-	IssuerURL string
-	ClientID  string
-	TTL       int
+	IssuerURL               string
+	ClientID                string
+	Audience                string
+	AccessTokenPurposeClaim string
+	AccessTokenPurpose      string
+	TTL                     int
 }
 
 // authzCacheTTL returns the safe TTL for authorization caches that depend on metadata.
@@ -243,6 +248,11 @@ func (r *MaaSAuthPolicyReconciler) fetchOIDCConfig(ctx context.Context, log logr
 		return nil
 	}
 
+	if (oidc.AccessTokenPurposeClaim == "") != (oidc.AccessTokenPurpose == "") {
+		log.Error(nil, "Tenant external OIDC access-token purpose claim and value must be configured together")
+		return nil
+	}
+
 	const (
 		defaultOIDCJWKSTTL = 300
 		minOIDCJWKSTTL     = 30
@@ -263,13 +273,18 @@ func (r *MaaSAuthPolicyReconciler) fetchOIDCConfig(ctx context.Context, log logr
 	log.Info("OIDC configuration loaded from tenant platform context",
 		"issuerUrl", oidc.IssuerURL,
 		"clientId", oidc.ClientID,
+		"audience", oidc.Audience,
+		"accessTokenPurposeClaim", oidc.AccessTokenPurposeClaim,
 		"ttl", ttl,
 		"source", platformContext.Source)
 
 	return &oidcConfig{
-		IssuerURL: oidc.IssuerURL,
-		ClientID:  oidc.ClientID,
-		TTL:       ttl,
+		IssuerURL:               oidc.IssuerURL,
+		ClientID:                oidc.ClientID,
+		Audience:                oidc.Audience,
+		AccessTokenPurposeClaim: oidc.AccessTokenPurposeClaim,
+		AccessTokenPurpose:      oidc.AccessTokenPurpose,
+		TTL:                     ttl,
 	}
 }
 
@@ -383,26 +398,46 @@ const (
 		`: (has(auth.identity.preferred_username) ? auth.identity.preferred_username ` +
 		`: (has(auth.identity.sub) ? auth.identity.sub : auth.identity.user.username))`
 
-	// celGroups extracts groups from API key, OIDC, or K8s token
-	// API key: uses apiKeyValidation.groups (snapshot at key creation)
-	// OIDC: uses groups claim (no .user. prefix)
-	// K8s: uses user.groups (from TokenReview)
+	// celGroups extracts the group list used for subscription selection,
+	// cache keys, and metrics labels.
+	// API key: uses apiKeyValidation.groups (snapshot at key creation).
+	// The source for token identities is selected by identity type, never by
+	// claim presence: JWT identities (auth.identity.iss set) use only the
+	// groups claim, TokenReview identities use only user.groups. Authorino
+	// overlays the decoded JWT payload into auth.identity, so a JWT could
+	// otherwise craft a "user" claim and impersonate TokenReview groups.
+	// Both sources are gated on the canonical pattern and yield an empty
+	// list on failure, keeping subscription selection, the cache key, and
+	// the X-MaaS-Group header consistent with the oidc-groups-safe denial:
+	// a TokenReview group that fails the pattern must never authorize a
+	// subscription the forwarded identity header omits.
 	celGroups = `(has(auth.metadata) && has(auth.metadata.apiKeyValidation)) ` +
 		`? auth.metadata.apiKeyValidation.groups ` +
-		`: (has(auth.identity.groups) ? auth.identity.groups : auth.identity.user.groups)`
+		`: (has(auth.identity.iss) ? ` +
+		`(has(auth.identity.groups) && ` + celOIDCGroupsSafe + ` ? auth.identity.groups : []) : ` +
+		`(has(auth.identity.user.groups) && ` +
+		`auth.identity.user.groups.all(g, g.matches('` + safeGroupNamePattern + `')) ? ` +
+		`auth.identity.user.groups : []))`
 
-	safeGroupNamePattern = `^[A-Za-z0-9:._/ -]+$`
+	safeGroupNamePattern = groupname.Pattern
 	celOIDCGroupsSafe    = `auth.identity.groups.all(g, g.matches('` + safeGroupNamePattern + `'))`
 
 	// celTokenGroupsHeaderJSON renders the X-MaaS-Group header for non-API-key
-	// identities. OIDC tokens may omit or provide an empty groups claim, but API
-	// key minting still requires at least system:authenticated to match the
-	// default subscription.
-	celTokenGroupsHeaderJSON = `has(auth.identity.groups) ? ` +
-		`(size(auth.identity.groups) > 0 && ` + celOIDCGroupsSafe + ` ? ` +
+	// identities. The group source is selected by identity type, never by
+	// claim presence: JWT identities (auth.identity.iss set) use only the
+	// groups claim, TokenReview identities use only user.groups — Authorino
+	// overlays the decoded JWT payload into auth.identity, so a JWT could
+	// otherwise craft a "user" claim and reach the TokenReview branch. Both
+	// sources are gated on the canonical group-name pattern because CEL builds
+	// the JSON by concatenation without escaping. Identities with no usable
+	// groups still get system:authenticated, which API-key minting requires
+	// to match the default subscription.
+	celTokenGroupsHeaderJSON = `has(auth.identity.iss) ? ` +
+		`(has(auth.identity.groups) && size(auth.identity.groups) > 0 && ` + celOIDCGroupsSafe + ` ? ` +
 		`'["system:authenticated","' + auth.identity.groups.join('","') + '"]' : ` +
 		`'["system:authenticated"]') : ` +
-		`(has(auth.identity.user.groups) && size(auth.identity.user.groups) > 0 ? ` +
+		`(has(auth.identity.user.groups) && size(auth.identity.user.groups) > 0 && ` +
+		`auth.identity.user.groups.all(g, g.matches('` + safeGroupNamePattern + `')) ? ` +
 		`'["system:authenticated","' + auth.identity.user.groups.join('","') + '"]' : ` +
 		`'["system:authenticated"]')`
 
@@ -635,7 +670,7 @@ func (r *MaaSAuthPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		for _, c := range conflicts {
 			names = append(names, c.String())
 		}
-		r.Recorder.Eventf(policy, "Warning", "ConflictingAuthPolicy",
+		r.Recorder.Eventf(policy, nil, "Warning", "ConflictingAuthPolicy", "DetectConflictingAuthPolicies",
 			"Detected %d non-MaaS AuthPolic%s on MaaS auth surfaces: %s",
 			len(conflicts), pluralY(len(conflicts)), strings.Join(names, "; "))
 	}
@@ -644,7 +679,7 @@ func (r *MaaSAuthPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		prevConflict != nil &&
 		prevConflict.Status == metav1.ConditionTrue
 	if shouldEmitResolvedEvent && r.Recorder != nil {
-		r.Recorder.Event(policy, "Normal", "ConflictingAuthPolicyResolved",
+		r.Recorder.Eventf(policy, nil, "Normal", "ConflictingAuthPolicyResolved", "DetectConflictingAuthPolicies",
 			"All conflicting AuthPolicies on MaaS auth surfaces have been resolved")
 	}
 
@@ -713,6 +748,24 @@ type authPolicyRef struct {
 	Namespace      string
 	Model          string
 	ModelNamespace string
+}
+
+// subscriptionInfoStringHeader injects a non-empty field from the resolved
+// MaaSSubscription (Authorino subscription-info metadata) as an X-MaaS-* header.
+func subscriptionInfoStringHeader(jsonField string) map[string]any {
+	path := fmt.Sprintf(`auth.metadata["subscription-info"].%s`, jsonField)
+	return map[string]any{
+		"when": []any{
+			map[string]any{
+				"predicate": fmt.Sprintf(`has(%s) && %s != ""`, path, path),
+			},
+		},
+		"plain": map[string]any{
+			"expression": path,
+		},
+		"metrics":  false,
+		"priority": int64(0),
+	}
 }
 
 // buildGatewayAuthPolicySpec returns the Authorino AuthPolicy spec for the singleton
@@ -855,6 +908,18 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, 
 					map[string]any{
 						"predicate": `!("x-maas-subscription-rate-limit-id" in request.headers)`,
 					},
+					map[string]any{
+						"predicate": `!("x-maas-organization-id" in request.headers)`,
+					},
+					map[string]any{
+						"predicate": `!("x-maas-cost-center" in request.headers)`,
+					},
+					map[string]any{
+						"predicate": `!("x-maas-identity" in request.headers)`,
+					},
+					map[string]any{
+						"predicate": `!("x-maas-admin-scope" in request.headers)`,
+					},
 				},
 			},
 		},
@@ -940,28 +1005,21 @@ allow {
 }`,
 			},
 		}
-		// oidc-client-bound enforces that OIDC JWTs were issued to the configured
-		// OAuth client (azp claim). The has(auth.identity.azp) guard is required so
-		// that OpenShift TokenReview identities (which carry no azp claim) are not
-		// matched by this rule and denied with 403.
+		// oidc-client-bound enforces the external-JWT issuer and OAuth client.
+		// TokenReview identities have a user object rather than a top-level iss
+		// claim and therefore remain on their existing authorization path.
 		authorizationRules["oidc-client-bound"] = map[string]any{
-			"when": []any{
-				map[string]any{
-					"predicate": celIsNotAPIKey +
-						` && request.headers.authorization.matches("^Bearer [^.]+\\.[^.]+\\.[^.]+$")` +
-						` && has(auth.identity.azp)`,
-				},
-			},
+			"when":     authpolicy.OIDCTokenBoundWhen(celIsNotAPIKey),
 			"metrics":  false,
 			"priority": int64(1),
 			"patternMatching": map[string]any{
-				"patterns": []any{
-					map[string]any{
-						"selector": "auth.identity.azp",
-						"operator": "eq",
-						"value":    oidc.ClientID,
-					},
-				},
+				"patterns": authpolicy.OIDCTokenBoundPatterns(
+					oidc.IssuerURL,
+					oidc.ClientID,
+					oidc.Audience,
+					oidc.AccessTokenPurposeClaim,
+					oidc.AccessTokenPurpose,
+				),
 			},
 		}
 	}
@@ -1080,15 +1138,13 @@ allow {
 						"metrics":  false,
 						"priority": int64(1),
 					},
-					// Only inject X-MaaS-Subscription when there is a real value to inject.
-					// An empty string injected for K8s tokens without a subscription header
-					// causes maas-api to filter by an empty subscription name and return 0 models.
-					// The old maas-api-auth-policy never injected this header for K8s tokens —
-					// only for API keys with a non-empty subscription field.
+					// Inject only for API keys with a subscription. Token requests keep the
+					// client header, which subscription-info uses to select a subscription.
+					// Re-injecting that header produces duplicate values in usage logs.
 					"X-MaaS-Subscription": map[string]any{
 						"when": []any{
 							map[string]any{
-								"predicate": `(has(auth.metadata) && has(auth.metadata.apiKeyValidation) && auth.metadata.apiKeyValidation.subscription != "") || "x-maas-subscription" in request.headers`,
+								"predicate": `has(auth.metadata) && has(auth.metadata.apiKeyValidation) && auth.metadata.apiKeyValidation.subscription != ""`,
 							},
 						},
 						"plain": map[string]any{
@@ -1124,6 +1180,20 @@ allow {
 						"metrics":  false,
 						"priority": int64(0),
 					},
+					// llm-d flow-control headers, canonical and legacy, from the subscription selected
+					// by maas-api. They are always set, empty when unknown, so client-supplied values
+					// never reach the scheduler. Keys are lowercase so they replace every client copy.
+					"x-llm-d-inference-objective":     subscriptionInfoHeader("objective"),
+					"x-gateway-inference-objective":   subscriptionInfoHeader("objective"),
+					"x-llm-d-inference-fairness-id":   subscriptionInfoHeader("fairnessId"),
+					"x-gateway-inference-fairness-id": subscriptionInfoHeader("fairnessId"),
+					// Organization and cost center come from the resolved MaaSSubscription
+					// (subscription-info), not the client. Organization is always set, empty
+					// when unresolved, so a client-supplied value can never survive as
+					// telemetry attribution. The lowercase key replaces every client copy.
+					"x-maas-organization-id": subscriptionInfoHeader("organizationId"),
+					"X-MaaS-Cost-Center":     subscriptionInfoStringHeader("costCenter"),
+					"X-MaaS-Identity":        verifiedIdentityHeader(oidc, celIsNotAPIKey),
 				},
 				"filters": map[string]any{
 					"identity": map[string]any{
@@ -1190,18 +1260,30 @@ allow {
 				"message": map[string]any{
 					"value": "Authentication required",
 				},
+				"body": map[string]any{
+					"value": `{"error":{"message":"Authentication required","type":"authentication_error","code":401}}`,
+				},
+				"headers": map[string]any{
+					"content-type": map[string]any{
+						"value": "application/json",
+					},
+				},
 			},
 			"unauthorized": map[string]any{
 				"code": int64(403),
 				"body": map[string]any{
-					"expression": `has(auth.metadata["subscription-info"].message) ? auth.metadata["subscription-info"].message : "Access denied"`,
+					"expression": `'{"error":{"message":"' + (has(auth.metadata["subscription-info"].message)` +
+						` ? auth.metadata["subscription-info"].message` +
+						`.replace('\\', '\\\\').replace('"', '\\"')` +
+						`.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')` +
+						` : "Access denied") + '","type":"authorization_error","code":403}}'`,
 				},
 				"headers": map[string]any{
 					"x-ext-auth-reason": map[string]any{
 						"expression": `has(auth.metadata["subscription-info"].error) ? auth.metadata["subscription-info"].error : "unauthorized"`,
 					},
 					"content-type": map[string]any{
-						"value": "text/plain",
+						"value": "application/json",
 					},
 				},
 			},
@@ -1228,6 +1310,23 @@ allow {
 			"rules": defaultsRules,
 		},
 	}
+}
+
+// subscriptionInfoHeader is a success response header set from a subscription-info field, or
+// to an empty value when the field is absent. The expression never fails: subscription-info is
+// not fetched for every request, and a failing header drops the others in its priority group.
+func subscriptionInfoHeader(field string) map[string]any {
+	return map[string]any{
+		"plain":    map[string]any{"expression": subscriptionInfoFieldExpr(field)},
+		"metrics":  false,
+		"priority": int64(0),
+	}
+}
+
+// subscriptionInfoFieldExpr is a CEL expression for a subscription-info field, or "" when absent.
+func subscriptionInfoFieldExpr(field string) string {
+	return fmt.Sprintf(`has(auth.metadata) && "subscription-info" in auth.metadata && `+
+		`has(auth.metadata["subscription-info"].%[1]s) ? auth.metadata["subscription-info"].%[1]s : ""`, field)
 }
 
 func (r *MaaSAuthPolicyReconciler) gatewayAuthPolicyName(gatewayNamespace, gatewayName string) string {
@@ -1998,7 +2097,7 @@ func (r *MaaSAuthPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	log := ctrl.Log.WithName("maas-authpolicy-controller")
 
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("maas-authpolicy-controller")
+		r.Recorder = mgr.GetEventRecorder("maas-authpolicy-controller")
 	}
 
 	// Reject negative TTL values

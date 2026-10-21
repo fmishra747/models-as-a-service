@@ -16,8 +16,10 @@ const (
 	DefaultMetricsCertDir = "/tmp/k8s-metrics-server/metrics-certs"
 
 	// Header configuration constants.
-	HeaderUsername = "X-MaaS-Username"
-	HeaderGroup    = "X-MaaS-Group"
+	HeaderUsername       = "X-MaaS-Username"
+	HeaderGroup          = "X-MaaS-Group"
+	HeaderIdentity       = "X-MaaS-Identity"
+	HeaderOrganizationID = "X-MaaS-Organization-Id"
 
 	// API Key configuration defaults.
 	// DefaultAPIKeyMaxExpirationDays is the default maximum allowed expiration for API keys.

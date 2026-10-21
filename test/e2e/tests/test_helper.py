@@ -44,7 +44,7 @@ Environment variables (all optional unless noted):
   - E2E_TRLP_TEST_MODEL_PATH: Path to TRLP test model (default: /llm/e2e-trlp-test-simulated)
   - E2E_TRLP_TEST_MODEL_ID: Model ID for TRLP test model (default: test/e2e-trlp-test-model)
   - E2E_GATEWAY_AUTH_POLICY_NAME: Gateway Kuadrant AuthPolicy name (default: maas-gateway-auth)
-  - E2E_GATEWAY_PROPAGATION_RETRIES: Retries for empty 401/403 / AUTH_FAILURE / proxy 500 (default: 6)
+  - E2E_GATEWAY_PROPAGATION_RETRIES: Retries for empty 401/403 / AUTH_FAILURE / proxy 500/503 (default: 6)
   - E2E_GATEWAY_PROPAGATION_DELAY: Delay between gateway retries in seconds (default: 5)
   - E2E_GATEWAY_ENFORCED_TIMEOUT: Wait for AuthPolicy Accepted+Enforced (default: 180)
   - E2E_GATEWAY_ENFORCED_MISSING_GRACE: Fail early if AuthPolicy CR absent this long (default: 30)
@@ -88,7 +88,7 @@ MODEL_CANONICAL_ID = os.environ.get("E2E_MODEL_CANONICAL_ID", f"publishers/{MODE
 DEPLOYMENT_NAMESPACE = os.environ.get("DEPLOYMENT_NAMESPACE", "opendatahub")
 # Kuadrant gateway AuthPolicy that Authorino enforces for maas-api + model routes.
 GATEWAY_AUTH_POLICY_NAME = os.environ.get("E2E_GATEWAY_AUTH_POLICY_NAME", "maas-gateway-auth")
-# Empty 401/403 / Authorino AUTH_FAILURE / proxy-style 500 while Envoy catches up.
+# Empty 401/403 / Authorino AUTH_FAILURE / proxy-style 500/503 while Envoy catches up.
 GATEWAY_PROPAGATION_RETRIES = int(os.environ.get("E2E_GATEWAY_PROPAGATION_RETRIES", "6"))
 GATEWAY_PROPAGATION_DELAY = int(os.environ.get("E2E_GATEWAY_PROPAGATION_DELAY", "5"))
 # Wait for maas-gateway-auth Accepted+Enforced before minting keys / calling maas-api.
@@ -325,6 +325,7 @@ def kubectl_curl(
             "--restart=Never",
             f"--image={E2E_CURL_IMAGE}",
             "-n", namespace,
+            "--labels=maas-api-e2e-probe=true",
             "--command", "--", "sleep", "300",
         ]
         subprocess.run(create_cmd, capture_output=True, text=True, timeout=30, check=True)
@@ -531,20 +532,28 @@ def _is_transient_gateway_response(response) -> bool:
     - Empty 401/403: Envoy has not loaded the AuthPolicy yet (common after
       MaaSAuthPolicy churn; some gateways return 401 instead of 403).
     - 500 with AUTH_FAILURE: Authorino race while AuthConfig is updating.
-    - Empty or plain-text proxy 500 ("Internal Server Error"): Envoy/router
-      failure while upstream or auth filters are mid-reload. Distinct from
-      maas-api JSON errors like {"error":"Failed to create API key"}.
+    - Empty or plain-text proxy 500/503 ("Internal Server Error" /
+      "Service Unavailable"): Envoy/router failure while upstream or auth
+      filters are mid-reload. Distinct from maas-api JSON errors like
+      {"error":"Failed to create API key"}.
     """
     body = (response.text or "").strip()
     if response.status_code in (401, 403) and not body:
         return True
-    if response.status_code != 500:
+    if response.status_code not in (500, 503):
         return False
     if "AUTH_FAILURE" in body:
         return True
-    if not body or body in ("Internal Server Error", "Internal Server Error."):
+    if not body or body in (
+        "Internal Server Error",
+        "Internal Server Error.",
+        "Service Unavailable",
+        "Service Unavailable.",
+    ):
         return True
-    if body.startswith("<") and "Internal Server Error" in body:
+    if body.startswith("<") and (
+        "Internal Server Error" in body or "Service Unavailable" in body
+    ):
         return True
     return False
 
@@ -562,14 +571,20 @@ def _is_connect_failure(exc: requests.exceptions.ConnectionError) -> bool:
     return isinstance(reason, NewConnectionError)
 
 
-def _request_with_gateway_retry(method, url, retries=None, delay=None, **kwargs):
+def _request_with_gateway_retry(method, url, retries=None, delay=None, deadline=None, **kwargs):
     """Make an HTTP request, retrying transient gateway/auth propagation errors.
 
     See ``_is_transient_gateway_response`` for retryable status/body patterns.
     Connection errors are retried only when the request was never sent
     (``_is_connect_failure``), which is safe for POST.
 
+    When ``deadline`` is set (Unix timestamp), each request timeout, retry delay,
+    and gateway-enforcement wait is clamped to the remaining time so polling loops
+    cannot exceed their outer deadline.
+
     Returns the last response — callers' assertions surface a permanent failure.
+    Raises:
+        TimeoutError: When ``deadline`` has passed before any response was received.
     """
     retries = GATEWAY_PROPAGATION_RETRIES if retries is None else retries
     delay = GATEWAY_PROPAGATION_DELAY if delay is None else delay
@@ -577,19 +592,34 @@ def _request_with_gateway_retry(method, url, retries=None, delay=None, **kwargs)
     verify = kwargs.pop("verify", TLS_VERIFY)
     r = None
     for attempt in range(1, retries + 1):
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if r is not None:
+                    return r
+                raise TimeoutError(
+                    f"Request deadline exceeded before completing request to {url}"
+                )
+            request_timeout = min(timeout, max(1, int(remaining)))
+        else:
+            request_timeout = timeout
         try:
-            r = method(url, timeout=timeout, verify=verify, **kwargs)
+            r = method(url, timeout=request_timeout, verify=verify, **kwargs)
         except requests.exceptions.ConnectionError as exc:
             if attempt >= retries or not _is_connect_failure(exc):
                 raise
+            retry_delay = delay
+            if deadline is not None:
+                retry_delay = min(delay, max(0, int(deadline - time.time())))
             log.info(
                 "Gateway connection failed before sending (attempt %d/%d: %s), retrying in %ds...",
                 attempt,
                 retries,
                 exc,
-                delay,
+                retry_delay,
             )
-            time.sleep(delay)
+            if retry_delay > 0:
+                time.sleep(retry_delay)
             continue
         if _is_transient_gateway_response(r) and attempt < retries:
             log.info(
@@ -600,14 +630,25 @@ def _request_with_gateway_retry(method, url, retries=None, delay=None, **kwargs)
                 (r.text or "").strip(),
                 delay,
             )
-            # After the first proxy-style 500, re-check AuthPolicy Enforced so
-            # remaining attempts are less likely to hit a mid-reload window.
-            if r.status_code == 500 and attempt == 1:
-                try:
-                    _wait_for_gateway_auth_enforced(timeout=min(60, GATEWAY_ENFORCED_TIMEOUT))
-                except TimeoutError:
-                    pass
-            time.sleep(delay)
+            # After the first proxy-style 500/503, re-check AuthPolicy Enforced
+            # so remaining attempts are less likely to hit a mid-reload window.
+            if r.status_code in (500, 503) and attempt == 1:
+                enforcement_timeout = min(60, GATEWAY_ENFORCED_TIMEOUT)
+                if deadline is not None:
+                    enforcement_timeout = min(
+                        enforcement_timeout,
+                        max(0, int(deadline - time.time())),
+                    )
+                if enforcement_timeout > 0:
+                    try:
+                        _wait_for_gateway_auth_enforced(timeout=enforcement_timeout)
+                    except TimeoutError:
+                        pass
+            retry_delay = delay
+            if deadline is not None:
+                retry_delay = min(delay, max(0, int(deadline - time.time())))
+            if retry_delay > 0:
+                time.sleep(retry_delay)
             continue
         return r
     return r
@@ -616,7 +657,7 @@ def _request_with_gateway_retry(method, url, retries=None, delay=None, **kwargs)
 def _create_api_key_raw(oc_token: str, name: str = None, subscription: str = None):
     """Create an API key and return the raw response (for testing error cases).
 
-    Retries empty 401/403, Authorino AUTH_FAILURE, and proxy-style 500s so
+    Retries empty 401/403, Authorino AUTH_FAILURE, and proxy-style 500/503s so
     callers see the real API response after gateway AuthPolicy propagation,
     not a transient reject.
 
@@ -743,7 +784,7 @@ def _is_not_found_error(stderr):
     return "notfound" in stderr_lower or "not found" in stderr_lower
 
 
-def _run_oc(cmd, *, input_text=None, timeout=None):
+def _run_oc(cmd, *, input_text=None, timeout=None, retry_budget=None):
     """Run an oc/kubectl command, retrying transient API server and network errors.
 
     Retries while stderr matches ``_is_transient_kubectl_error`` or the process
@@ -751,9 +792,12 @@ def _run_oc(cmd, *, input_text=None, timeout=None):
     Any other outcome, NotFound included, is returned on the first attempt so
     callers keep interpreting ``returncode``/``stderr`` themselves. Once the
     budget is spent, the last result is returned or TimeoutExpired re-raised.
+
+    ``retry_budget`` caps total retry time (seconds) for callers with an outer
+    deadline, such as gateway-enforcement probes inside polling loops.
     """
     timeout = OC_TIMEOUT if timeout is None else timeout
-    deadline = time.monotonic() + OC_RETRY_BUDGET
+    deadline = time.monotonic() + (retry_budget if retry_budget is not None else OC_RETRY_BUDGET)
     what = " ".join([os.path.basename(cmd[0]), *cmd[1:3]])
     attempt = 0
     while True:
@@ -782,7 +826,7 @@ def _run_oc(cmd, *, input_text=None, timeout=None):
         time.sleep(delay)
 
 
-def _get_cr(kind, name, namespace=None):
+def _get_cr(kind, name, namespace=None, *, oc_timeout=None, oc_retry_budget=None):
     """Get a CR as dict, or None if not found. Retries on transient errors.
 
     Returns None only when the resource genuinely does not exist (server NotFound).
@@ -791,7 +835,11 @@ def _get_cr(kind, name, namespace=None):
     from true absence.
     """
     namespace = namespace or _ns()
-    result = _run_oc(["oc", "get", kind, name, "-n", namespace, "-o", "json"])
+    result = _run_oc(
+        ["oc", "get", kind, name, "-n", namespace, "-o", "json"],
+        timeout=oc_timeout,
+        retry_budget=oc_retry_budget,
+    )
 
     if result.returncode == 0:
         return json.loads(result.stdout)
@@ -1147,7 +1195,7 @@ def _poll_status(api_key, expected, path=None, extra_headers=None, model_name=No
                 return r
             last = r
             # Parallel workers can churn maas-gateway-auth; empty 401/403,
-            # AUTH_FAILURE, or proxy-style 500 usually means propagation.
+            # AUTH_FAILURE, or proxy-style 500/503 usually means propagation.
             if _is_transient_gateway_response(r) and time.time() - last_auth_recheck >= 10:
                 remaining = max(0, int(deadline - time.time()))
                 if remaining > 0:
@@ -1208,6 +1256,33 @@ def chat(prompt: str, model_v1: str, headers: dict, model_name: str, *,
     if stream:
         body["stream"] = True
     return requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY, stream=stream)
+
+
+OPENAI_SSE_DONE_LINE = "data: [DONE]"
+
+
+def assert_openai_sse_chat_stream(response: requests.Response) -> list[str]:
+    """
+    Given a streaming chat/completions Response (stream=True), assert OpenAI-style SSE:
+    HTTP 200, text/event-stream, multiple parseable data: JSON chunks, and data: [DONE].
+    Returns non-empty event lines (including the terminal [DONE] line).
+    """
+    assert response.status_code == 200, (
+        f"expected streaming HTTP 200, got {response.status_code}: {(response.text or '')[:500]}"
+    )
+    content_type = response.headers.get("content-type", "")
+    assert "text/event-stream" in content_type, (
+        f"expected text/event-stream, got content-type={content_type!r}"
+    )
+    events = [line for line in response.iter_lines(decode_unicode=True) if line]
+    assert events, "streaming response contained no SSE lines"
+    assert events[-1] == OPENAI_SSE_DONE_LINE, f"stream did not end with [DONE]: {events[-3:]}"
+    data_chunks = [e for e in events[:-1] if e.startswith("data: {")]
+    assert data_chunks, f"stream carried no JSON data chunks: {events[:5]}"
+    for chunk in data_chunks:
+        payload = chunk[len("data: ") :]
+        json.loads(payload)
+    return events
 
 
 def completions(prompt: str, model_v1: str, headers: dict, model_name: str):
@@ -1339,7 +1414,16 @@ def _wait_for_gateway_auth_enforced(
     )
 
     while time.time() < deadline:
-        cr = _get_cr("authpolicy", name, namespace)
+        remaining = max(0, int(deadline - time.time()))
+        if remaining <= 0:
+            break
+        cr = _get_cr(
+            "authpolicy",
+            name,
+            namespace,
+            oc_timeout=min(OC_TIMEOUT, remaining),
+            oc_retry_budget=remaining,
+        )
         if cr is None:
             last_snapshot = "AuthPolicy not found"
             now = time.time()
@@ -1374,7 +1458,9 @@ def _wait_for_gateway_auth_enforced(
                 log.info("Gateway AuthPolicy %s/%s is Accepted and Enforced", namespace, name)
                 return cr
             log.debug("Gateway AuthPolicy %s/%s not ready: %s", namespace, name, last_snapshot)
-        time.sleep(2)
+        sleep_for = min(2, max(0, int(deadline - time.time())))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
     raise TimeoutError(
         f"Gateway AuthPolicy {namespace}/{name} was not Accepted+Enforced within {timeout}s "
@@ -1383,18 +1469,29 @@ def _wait_for_gateway_auth_enforced(
     )
 
 
-def _wait_for_token_rate_limit_policy(model_ref, model_namespace=MODEL_NAMESPACE, timeout=60):
-    """Wait for TokenRateLimitPolicy to be created and enforced for a model.
+def _wait_for_token_rate_limit_policy(
+    model_ref, model_namespace=MODEL_NAMESPACE, timeout=60, *, subscription_name=None, subscription_namespace=None
+):
+    """Wait for the current TokenRateLimitPolicy generation to be enforced.
+
+    If a subscription is supplied, wait until the policy includes it. This
+    prevents accepting the old policy before the controller updates its spec.
 
     Args:
         model_ref: Name of the model (e.g., "e2e-distinct-simulated")
         model_namespace: Namespace where the TRLP should be created (default: MODEL_NAMESPACE)
         timeout: Maximum wait time in seconds (default: 60)
+        subscription_name: Subscription that the policy must include, if supplied
+        subscription_namespace: Subscription namespace (defaults to _ns())
 
     Raises:
         TimeoutError: If TRLP isn't created and enforced within timeout
     """
     trlp_name = f"maas-trlp-{model_ref}"
+    expected_subscription = (
+        f"{subscription_namespace or _ns()}/{subscription_name}" if subscription_name else None
+    )
+    last_snapshot = "not found"
     deadline = time.time() + timeout
     log.info(f"Waiting for TokenRateLimitPolicy {trlp_name} in {model_namespace} (timeout: {timeout}s)...")
 
@@ -1408,12 +1505,31 @@ def _wait_for_token_rate_limit_policy(model_ref, model_namespace=MODEL_NAMESPACE
         if result.returncode == 0:
             try:
                 trlp = json.loads(result.stdout)
-                conditions = trlp.get("status", {}).get("conditions", [])
+                metadata = trlp.get("metadata", {})
+                status = trlp.get("status", {})
+                generation = metadata.get("generation")
+                observed = status.get("observedGeneration")
+                conditions = status.get("conditions", [])
                 enforced = next((c for c in conditions if c.get("type") == "Enforced"), None)
-                if enforced and enforced.get("status") == "True":
-                    log.info(f"TokenRateLimitPolicy {trlp_name} is enforced")
+                subscriptions = {
+                    name.strip()
+                    for name in metadata.get("annotations", {}).get(
+                        "maas.opendatahub.io/subscriptions", ""
+                    ).split(",")
+                }
+                includes_subscription = expected_subscription is None or expected_subscription in subscriptions
+                last_snapshot = (
+                    f"generation={generation}, observedGeneration={observed}, "
+                    f"Enforced={enforced}, includes_subscription={includes_subscription}"
+                )
+                if (
+                    enforced and enforced.get("status") == "True"
+                    and generation is not None and observed == generation
+                    and includes_subscription
+                ):
+                    log.info(f"TokenRateLimitPolicy {trlp_name} generation {generation} is enforced")
                     return
-                log.debug(f"TokenRateLimitPolicy {trlp_name} exists but not enforced yet")
+                log.debug(f"TokenRateLimitPolicy {trlp_name} is not ready: {last_snapshot}")
             except (json.JSONDecodeError, KeyError) as e:
                 log.debug(f"Failed to parse TRLP status: {e}")
         elif _is_not_found_error(result.stderr):
@@ -1430,7 +1546,7 @@ def _wait_for_token_rate_limit_policy(model_ref, model_namespace=MODEL_NAMESPACE
         time.sleep(3)
 
     raise TimeoutError(
-        f"TokenRateLimitPolicy {trlp_name} was not created and enforced in {model_namespace} within {timeout}s"
+        f"TokenRateLimitPolicy {trlp_name} was not created and enforced in {model_namespace} within {timeout}s: {last_snapshot}"
     )
 
 
@@ -1676,6 +1792,8 @@ def _wait_for_subscription_inference_ready(
         model_name,
         model_namespace=model_namespace,
         timeout=timeout,
+        subscription_name=subscription_name,
+        subscription_namespace=namespace,
     )
     return _wait_for_subscription_trlp_status(
         subscription_name,
@@ -1910,7 +2028,7 @@ def _scale_controller(replicas, namespace=None, timeout=60):
     log.info(f"Scaling maas-controller to {replicas} replicas in namespace {namespace}...")
 
     # Scale the deployment
-    result = subprocess.run(
+    subprocess.run(
         ["oc", "scale", "deployment", "maas-controller",
          f"--replicas={replicas}", "-n", namespace],
         check=True,
@@ -1977,7 +2095,7 @@ def _scale_kuadrant_controller(replicas, namespace="kuadrant-system", timeout=60
     log.info(f"Scaling kuadrant-operator to {replicas} replicas in namespace {namespace}...")
 
     # Scale the deployment
-    result = subprocess.run(
+    subprocess.run(
         ["oc", "scale", "deployment", "kuadrant-operator-controller-manager",
          f"--replicas={replicas}", "-n", namespace],
         check=True,

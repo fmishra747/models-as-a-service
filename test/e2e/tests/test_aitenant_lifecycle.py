@@ -38,6 +38,7 @@ GATEWAY_NAME = os.environ.get("GATEWAY_NAME", "maas-default-gateway")
 INFRA_NAMESPACE = MAAS_API_DEPLOYMENT_NAMESPACE
 AITENANT_GATEWAY_CLASS_NAME = os.environ.get("AITENANT_GATEWAY_CLASS_NAME", "openshift-default")
 OC_TIMEOUT = int(os.environ.get("E2E_OC_TIMEOUT", "60"))
+CLEANUP_SERVICEACCOUNT_NAME = "maas-api-cleanup"
 
 
 def _oc_bin():
@@ -86,6 +87,60 @@ def _delete_best_effort(kind, name, namespace=None, *, timeout="60s"):
         _delete(kind, name, namespace, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask the test failure
         print(f"[cleanup] failed to delete {kind}/{name}: {exc}")
+
+
+def _delete_async(kind, name, namespace=None):
+    args = ["delete", kind, name, "--wait=false", "--ignore-not-found"]
+    if namespace:
+        args.extend(["-n", namespace])
+    result = _oc_run(args)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"`oc {' '.join(args)}` failed: {result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
+def _wait_for_cleanup_serviceaccount(*, timeout=180, interval=5):
+    _wait_for_json(
+        "serviceaccount",
+        CLEANUP_SERVICEACCOUNT_NAME,
+        INFRA_NAMESPACE,
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+def _aitenant_deletion_blocked(obj):
+    for cond in (obj.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "Ready" and cond.get("reason") == "DeletionBlocked":
+            return cond.get("message") or "DeletionBlocked"
+    return None
+
+
+def _wait_for_aitenant_removed_after_revocation_operand_loss(case, *, timeout=360, interval=5):
+    """Fail if AITenant stays DeletionBlocked too long after the cleanup SA is removed."""
+    deadline = time.time() + timeout
+    blocked_since = None
+    while time.time() < deadline:
+        obj = _get_json_or_none(AITENANT_KIND, case["aitenant_name"], AITENANT_NAMESPACE)
+        if obj is None:
+            return
+        blocked_message = _aitenant_deletion_blocked(obj)
+        if blocked_message:
+            if blocked_since is None:
+                blocked_since = time.time()
+            elif time.time() - blocked_since > 120:
+                raise AssertionError(
+                    "AITenant remained DeletionBlocked >120s after removing "
+                    f"{CLEANUP_SERVICEACCOUNT_NAME}: {blocked_message}"
+                )
+        else:
+            blocked_since = None
+        time.sleep(interval)
+    raise AssertionError(
+        f"AITenant {case['aitenant_name']} still exists after {timeout}s "
+        f"(last object: {_get_json_or_none(AITENANT_KIND, case['aitenant_name'], AITENANT_NAMESPACE)})"
+    )
 
 
 def _get_json_or_none(kind, name, namespace=None):
@@ -625,3 +680,36 @@ class TestAITenantLifecycle:
             )
         finally:
             _cleanup_aitenant_fixture(aitenant_name, gateway_name)
+
+
+class TestAITenantRevocationOperandsSerial:
+    """Serial cluster mutators for API-key revocation operand recovery (RHAI-10848)."""
+
+    @pytest.mark.serial
+    def test_aitenant_delete_completes_after_cleanup_serviceaccount_removed(self):
+        """Simulates operand loss while AITenant is terminating.
+
+        The controller must recover operands or skip revocation explicitly; deletion
+        must not wedge with endless APIKeyCleanupFailed / DeletionBlocked.
+        """
+        case = _new_aitenant_case()
+        sa_removed = False
+        try:
+            _apply_gateway_fixture(case)
+            _apply_aitenant(case)
+            _assert_aitenant_bootstrap_resources(case)
+            _wait_for_cleanup_serviceaccount(timeout=180)
+
+            _delete_async(AITENANT_KIND, case["aitenant_name"], AITENANT_NAMESPACE)
+            _delete_async("serviceaccount", CLEANUP_SERVICEACCOUNT_NAME, INFRA_NAMESPACE)
+            sa_removed = True
+
+            _wait_for_aitenant_removed_after_revocation_operand_loss(case, timeout=360)
+            _wait_for_not_found(TENANT_CONFIG_KIND, TENANT_NAME, case["tenant_ns"], timeout=240)
+        finally:
+            if sa_removed:
+                try:
+                    _wait_for_cleanup_serviceaccount(timeout=300)
+                except Exception as exc:  # noqa: BLE001 - best-effort cluster repair
+                    print(f"[cleanup] maas-api-cleanup SA not restored after serial test: {exc}")
+            _cleanup_aitenant_fixture(case["aitenant_name"], case["gateway_name"])

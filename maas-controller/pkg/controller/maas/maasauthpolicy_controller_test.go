@@ -1528,8 +1528,9 @@ func TestMaaSAuthPolicyReconciler_CacheKeyModelIsolation(t *testing.T) {
 }
 
 // TestMaaSAuthPolicyReconciler_IdentityHeadersUpstream verifies that identity headers
-// (X-MaaS-Username, X-MaaS-Group, X-MaaS-Subscription) are injected into requests forwarded
-// to upstream workloads for the consolidated gateway-level auth policy.
+// (X-MaaS-Username, X-MaaS-Group, X-MaaS-Subscription, X-MaaS-KeyName,
+// X-MaaS-Organization-Id, X-MaaS-Cost-Center, X-MaaS-Identity) are injected into
+// requests forwarded to upstream workloads for the consolidated gateway-level auth policy.
 // All identity information is also available to TRLP and telemetry via filters.identity.
 //
 // After the gateway-level refactor, response shaping lives in the singleton gateway policy
@@ -1576,115 +1577,105 @@ func TestMaaSAuthPolicyReconciler_IdentityHeadersUpstream(t *testing.T) {
 		t.Fatalf("Get gateway AuthPolicy: %v", err)
 	}
 
-	// Test 1: Verify identity headers are forwarded upstream for consolidated gateway auth
-	t.Run("identity headers forwarded to upstream", func(t *testing.T) {
-		headers, found, err := unstructured.NestedMap(gwPolicy.Object, "spec", "defaults", "rules", "response", "success", "headers")
-		if err != nil {
-			t.Fatalf("Error checking headers: %v", err)
-		}
-		if !found {
-			t.Fatalf("response.success.headers should exist")
-		}
+	successHeaders := []string{"spec", "defaults", "rules", "response", "success", "headers"}
+	identityProperties := []string{"spec", "defaults", "rules", "response", "success", "filters", "identity", "json", "properties"}
 
-		requiredHeaders := []string{
+	t.Run("identity headers forwarded to upstream", func(t *testing.T) {
+		headers := nestedMapRequired(t, gwPolicy, successHeaders...)
+		for _, header := range []string{
 			"X-MaaS-Username", "X-MaaS-Username-Token",
 			"X-MaaS-Group", "X-MaaS-Group-Token",
 			"X-MaaS-Subscription",
 			"X-MaaS-KeyName",
-		}
-		for _, header := range requiredHeaders {
+			"x-maas-organization-id",
+			"X-MaaS-Cost-Center",
+			"X-MaaS-Identity",
+		} {
 			if _, exists := headers[header]; !exists {
 				t.Errorf("Identity header %q should be present in gateway response headers", header)
 			}
 		}
-
+		identityHeader, ok := headers["X-MaaS-Identity"].(map[string]any)
+		if !ok {
+			t.Fatalf("X-MaaS-Identity response is not a map: %#v", headers["X-MaaS-Identity"])
+		}
+		identityWhen, ok := identityHeader["when"].([]any)
+		if !ok || len(identityWhen) != 1 {
+			t.Fatalf("X-MaaS-Identity when clauses are invalid: %#v", identityHeader["when"])
+		}
+		identityClause, ok := identityWhen[0].(map[string]any)
+		if !ok || identityClause["predicate"] != "false" {
+			t.Fatalf("X-MaaS-Identity must stay disabled without the strict OIDC contract, got %#v", identityWhen)
+		}
 		if _, exists := headers["Authorization"]; exists {
 			t.Errorf("Authorization header should NOT be stripped (needed by FilterModelsByAccess)")
 		}
+		assertNonEmptySubscriptionHeader(t, headers, "X-MaaS-Cost-Center", "costCenter")
+		orgHeader, ok := headers["x-maas-organization-id"].(map[string]any)
+		if !ok {
+			t.Fatalf("x-maas-organization-id response is not a map: %#v", headers["x-maas-organization-id"])
+		}
+		if _, hasWhen := orgHeader["when"]; hasWhen {
+			t.Errorf("x-maas-organization-id must apply to every authorized request, got when %#v", orgHeader["when"])
+		}
+		if expr, _, _ := unstructured.NestedString(orgHeader, "plain", "expression"); expr != subscriptionInfoFieldExpr("organizationId") {
+			t.Errorf("x-maas-organization-id expression = %q, want empty fallback for organizationId", expr)
+		}
 	})
 
-	// Test 2: Verify filters.identity exists and contains all necessary data for TRLP and telemetry
-	t.Run("identity data available for TRLP and telemetry", func(t *testing.T) {
-		identity, found, err := unstructured.NestedMap(gwPolicy.Object, "spec", "defaults", "rules", "response", "success", "filters", "identity", "json", "properties")
-		if err != nil || !found {
-			t.Fatalf("filters.identity.json.properties missing: found=%v err=%v", found, err)
+	t.Run("flow-control headers set from subscription-info", func(t *testing.T) {
+		headers, _, err := unstructured.NestedMap(gwPolicy.Object, "spec", "defaults", "rules", "response", "success", "headers")
+		if err != nil {
+			t.Fatalf("Error checking headers: %v", err)
 		}
+		for header, field := range map[string]string{
+			"x-llm-d-inference-objective":     "objective",
+			"x-gateway-inference-objective":   "objective",
+			"x-llm-d-inference-fairness-id":   "fairnessId",
+			"x-gateway-inference-fairness-id": "fairnessId",
+		} {
+			cfg, ok := headers[header].(map[string]any)
+			if !ok {
+				t.Errorf("header %q missing from response.success.headers", header)
+				continue
+			}
+			if _, hasKey := cfg["key"]; hasKey {
+				t.Errorf("header %q must not override its lowercase name with key %v", header, cfg["key"])
+			}
+			if _, hasWhen := cfg["when"]; hasWhen {
+				t.Errorf("header %q must apply to every authorized request, got when %v", header, cfg["when"])
+			}
+			if expr, _, _ := unstructured.NestedString(cfg, "plain", "expression"); expr != subscriptionInfoFieldExpr(field) {
+				t.Errorf("header %q plain.expression = %q, want the subscription-info %s expression", header, expr, field)
+			}
+		}
+	})
 
-		requiredFields := []string{
-			"userid",
-			"groups",
-			"selected_subscription_key",
-			"selected_subscription_id",
-			"selected_subscription",
-			"subscription_info",
-		}
-		for _, field := range requiredFields {
+	t.Run("identity data available for TRLP and telemetry", func(t *testing.T) {
+		identity := nestedMapRequired(t, gwPolicy, identityProperties...)
+		for _, field := range []string{
+			"userid", "groups", "selected_subscription_key", "selected_subscription_id",
+			"selected_subscription", "subscription_info",
+		} {
 			if _, exists := identity[field]; !exists {
 				t.Errorf("filters.identity must include %q for TRLP/telemetry, but it's missing", field)
 			}
 		}
-		for _, field := range []string{"keyId"} {
-			if _, exists := identity[field]; !exists {
-				t.Errorf("filters.identity should include %q for observability, but it's missing", field)
+		if _, exists := identity["keyId"]; !exists {
+			t.Error("filters.identity should include \"keyId\" for observability, but it's missing")
+		}
+		for _, tc := range []struct{ field, want, why string }{
+			{"subscription_info", `auth.metadata["subscription-info"]`, "reference the full subscription-info object"},
+			{"selected_subscription_key", "resolvedModel", "prefer subscription-info.resolvedModel for BBR TRLP matching"},
+			{"selected_subscription_id", "rateLimitId", "read subscription-info.rateLimitId for TRLP matching"},
+		} {
+			expr := identityFieldExpression(t, identity, tc.field)
+			if !contains(expr, tc.want) {
+				t.Errorf("filters.identity[%q] = %s, want expression to %s", tc.field, expr, tc.why)
 			}
-		}
-
-		subscriptionInfoField, exists := identity["subscription_info"]
-		if !exists {
-			t.Error("filters.identity must include 'subscription_info' field")
-		} else {
-			subscriptionInfoMap, ok := subscriptionInfoField.(map[string]any)
-			if !ok {
-				t.Errorf("subscription_info should be a map, got %T", subscriptionInfoField)
-			} else {
-				expr, hasExpr := subscriptionInfoMap["expression"]
-				if !hasExpr {
-					t.Error("subscription_info should have an 'expression' field")
-				} else {
-					exprStr, ok := expr.(string)
-					if !ok {
-						t.Errorf("subscription_info expression should be a string, got %T", expr)
-					} else if !contains(exprStr, `auth.metadata["subscription-info"]`) {
-						t.Errorf("subscription_info expression should reference full subscription-info object, got: %s", exprStr)
-					}
-				}
-			}
-		}
-
-		keyField, exists := identity["selected_subscription_key"]
-		if !exists {
-			t.Fatal("selected_subscription_key missing")
-		}
-		keyMap, ok := keyField.(map[string]any)
-		if !ok {
-			t.Fatalf("selected_subscription_key should be a map, got %T", keyField)
-		}
-		keyExpr, ok := keyMap["expression"].(string)
-		if !ok {
-			t.Fatalf("selected_subscription_key expression missing")
-		}
-		if !contains(keyExpr, `resolvedModel`) {
-			t.Errorf("selected_subscription_key must prefer subscription-info.resolvedModel for BBR TRLP matching, got: %s", keyExpr)
-		}
-
-		idField, exists := identity["selected_subscription_id"]
-		if !exists {
-			t.Fatal("selected_subscription_id missing")
-		}
-		idMap, ok := idField.(map[string]any)
-		if !ok {
-			t.Fatalf("selected_subscription_id should be a map, got %T", idField)
-		}
-		idExpr, ok := idMap["expression"].(string)
-		if !ok {
-			t.Fatalf("selected_subscription_id expression missing")
-		}
-		if !contains(idExpr, `rateLimitId`) {
-			t.Errorf("selected_subscription_id must read subscription-info.rateLimitId for TRLP matching, got: %s", idExpr)
 		}
 	})
 
-	// Test 3: Verify metrics are enabled on identity filter
 	t.Run("identity filter has metrics enabled", func(t *testing.T) {
 		metricsEnabled, found, err := unstructured.NestedBool(gwPolicy.Object, "spec", "defaults", "rules", "response", "success", "filters", "identity", "metrics")
 		if err != nil || !found {
@@ -1694,6 +1685,59 @@ func TestMaaSAuthPolicyReconciler_IdentityHeadersUpstream(t *testing.T) {
 			t.Error("filters.identity.metrics must be true for telemetry to access identity data")
 		}
 	})
+}
+
+func assertNonEmptySubscriptionHeader(t *testing.T, headers map[string]any, header, field string) {
+	t.Helper()
+	raw, ok := headers[header].(map[string]any)
+	if !ok {
+		t.Fatalf("%s should be a map, got %T", header, headers[header])
+	}
+	plain, _ := raw["plain"].(map[string]any)
+	expr, _ := plain["expression"].(string)
+	wantExpr := `auth.metadata["subscription-info"].` + field
+	if expr != wantExpr {
+		t.Errorf("%s expression = %q, want %q", header, expr, wantExpr)
+	}
+	when, _ := raw["when"].([]any)
+	if len(when) == 0 {
+		t.Fatalf("%s should inject only when %s is non-empty", header, field)
+	}
+	when0, _ := when[0].(map[string]any)
+	pred, _ := when0["predicate"].(string)
+	if !strings.Contains(pred, wantExpr) || !strings.Contains(pred, `!= ""`) {
+		t.Errorf("%s when predicate = %q, want non-empty check on %s", header, pred, wantExpr)
+	}
+}
+
+func assertClearedResponseHeader(t *testing.T, headers map[string]any, header string) {
+	t.Helper()
+	cfg, ok := headers[header].(map[string]any)
+	if !ok {
+		t.Fatalf("header %q missing from response.success.headers", header)
+	}
+	if _, hasKey := cfg["key"]; hasKey {
+		t.Errorf("header %q must not override its lowercase name with key %v", header, cfg["key"])
+	}
+	if _, hasWhen := cfg["when"]; hasWhen {
+		t.Errorf("header %q must apply to every authorized request, got when %v", header, cfg["when"])
+	}
+	if value, found, _ := unstructured.NestedFieldNoCopy(cfg, "plain", "value"); !found || value != "" {
+		t.Errorf("header %q plain.value = %v (found %t), want empty string", header, value, found)
+	}
+}
+
+func identityFieldExpression(t *testing.T, identity map[string]any, field string) string {
+	t.Helper()
+	raw, ok := identity[field].(map[string]any)
+	if !ok {
+		t.Fatalf("filters.identity[%q] should be a map, got %T", field, identity[field])
+	}
+	expr, ok := raw["expression"].(string)
+	if !ok {
+		t.Fatalf("filters.identity[%q] expression missing", field)
+	}
+	return expr
 }
 
 func gatewayAuthPolicySpecTestObject(t *testing.T, oidc *oidcConfig) *unstructured.Unstructured {
@@ -1771,6 +1815,85 @@ func TestBuildGatewayAuthPolicySpec_K8sAuth(t *testing.T) {
 	}
 }
 
+func TestBuildGatewayAuthPolicySpec_ErrorResponses(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+
+	t.Run("unauthenticated returns JSON body with 401", func(t *testing.T) {
+		unauthn := nestedMapRequired(t, obj, "spec", "defaults", "rules", "response", "unauthenticated")
+
+		code, ok := unauthn["code"].(int64)
+		if !ok || code != 401 {
+			t.Fatalf("unauthenticated code = %v, want 401", unauthn["code"])
+		}
+
+		bodyMap, ok := unauthn["body"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated must have a body map for JSON error response")
+		}
+		bodyVal, ok := bodyMap["value"].(string)
+		if !ok || bodyVal == "" {
+			t.Fatal("unauthenticated body.value must be a non-empty JSON string")
+		}
+		if !strings.Contains(bodyVal, `"authentication_error"`) {
+			t.Errorf("unauthenticated body should contain authentication_error type, got: %s", bodyVal)
+		}
+		if !strings.Contains(bodyVal, `"code":401`) {
+			t.Errorf("unauthenticated body should contain code 401, got: %s", bodyVal)
+		}
+
+		headers, ok := unauthn["headers"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated must have headers with content-type")
+		}
+		ct, ok := headers["content-type"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated headers must include content-type")
+		}
+		if ct["value"] != "application/json" {
+			t.Errorf("unauthenticated content-type = %v, want application/json", ct["value"])
+		}
+	})
+
+	t.Run("unauthorized returns JSON body with 403", func(t *testing.T) {
+		unauthz := nestedMapRequired(t, obj, "spec", "defaults", "rules", "response", "unauthorized")
+
+		code, ok := unauthz["code"].(int64)
+		if !ok || code != 403 {
+			t.Fatalf("unauthorized code = %v, want 403", unauthz["code"])
+		}
+
+		bodyMap, ok := unauthz["body"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized must have a body map for JSON error response")
+		}
+		bodyExpr, ok := bodyMap["expression"].(string)
+		if !ok || bodyExpr == "" {
+			t.Fatal("unauthorized body.expression must be a non-empty CEL expression")
+		}
+		if !strings.Contains(bodyExpr, `"authorization_error"`) {
+			t.Errorf("unauthorized body should contain authorization_error type, got: %s", bodyExpr)
+		}
+		if !strings.Contains(bodyExpr, `"code":403`) {
+			t.Errorf("unauthorized body should contain code 403, got: %s", bodyExpr)
+		}
+		if !strings.Contains(bodyExpr, `.replace(`) {
+			t.Errorf("unauthorized body expression should JSON-escape the message with .replace(), got: %s", bodyExpr)
+		}
+
+		headers, ok := unauthz["headers"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized must have headers")
+		}
+		ct, ok := headers["content-type"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized headers must include content-type")
+		}
+		if ct["value"] != "application/json" {
+			t.Errorf("unauthorized content-type = %v, want application/json", ct["value"])
+		}
+	})
+}
+
 func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 	obj := gatewayAuthPolicySpecTestObject(t, nil)
 
@@ -1778,7 +1901,8 @@ func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 		obj.Object,
 		"spec", "defaults", "rules", "authorization", "deny-client-identity-headers", "patternMatching", "patterns",
 	)
-	if err != nil || !found || len(patterns) != 4 {
+
+	if err != nil || !found || len(patterns) != 8 {
 		t.Fatalf("deny-client-identity-headers patterns missing: found=%v len=%d err=%v", found, len(patterns), err)
 	}
 
@@ -1800,6 +1924,10 @@ func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 		`!("x-maas-group" in request.headers)`,
 		`!("x-maas-keyname" in request.headers)`,
 		`!("x-maas-subscription-rate-limit-id" in request.headers)`,
+		`!("x-maas-organization-id" in request.headers)`,
+		`!("x-maas-cost-center" in request.headers)`,
+		`!("x-maas-identity" in request.headers)`,
+		`!("x-maas-admin-scope" in request.headers)`,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("deny-client-identity-headers predicates = %#v, want %#v", got, want)
@@ -1808,6 +1936,55 @@ func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("deny-client-identity-headers predicates = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestBuildGatewayAuthPolicySpec_SubscriptionHeaderInjection(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+
+	predicate := nestedWhenPredicateRequired(t, obj,
+		"spec", "defaults", "rules", "response", "success", "headers", "X-MaaS-Subscription", "when")
+	wantPredicate := `has(auth.metadata) && has(auth.metadata.apiKeyValidation) && auth.metadata.apiKeyValidation.subscription != ""`
+	if predicate != wantPredicate {
+		t.Errorf("subscription header must be injected only for API keys with a subscription: got %q, want %q", predicate, wantPredicate)
+	}
+
+	// User tokens still use the client header for subscription selection, without
+	// adding another copy of that header to the upstream request.
+	wantSelection := `(has(auth.metadata) && has(auth.metadata.apiKeyValidation)) ` +
+		`? auth.metadata.apiKeyValidation.subscription : ` +
+		`("x-maas-subscription" in request.headers ? request.headers["x-maas-subscription"] : "")`
+	body := nestedStringRequired(t, obj,
+		"spec", "defaults", "rules", "metadata", "subscription-info", "http", "body", "expression")
+	if !strings.Contains(body, `"requestedSubscription": `+wantSelection) {
+		t.Errorf("subscription-info must select the client header for user tokens, got body %q", body)
+	}
+
+	cacheKey := nestedStringRequired(t, obj,
+		"spec", "defaults", "rules", "metadata", "subscription-info", "cache", "key", "selector")
+	if !strings.Contains(cacheKey, wantSelection) {
+		t.Errorf("subscription-info cache key must include the client header selection, got %q", cacheKey)
+	}
+}
+
+func TestSubscriptionInfoStringHeader(t *testing.T) {
+	h := subscriptionInfoStringHeader("organizationId")
+	plain, ok := h["plain"].(map[string]any)
+	if !ok {
+		t.Fatalf("plain should be a map, got %T", h["plain"])
+	}
+	expr, _ := plain["expression"].(string)
+	if expr != `auth.metadata["subscription-info"].organizationId` {
+		t.Errorf("expression = %q", expr)
+	}
+	when, _ := h["when"].([]any)
+	if len(when) != 1 {
+		t.Fatalf("when length = %d, want 1", len(when))
+	}
+	when0, _ := when[0].(map[string]any)
+	pred, _ := when0["predicate"].(string)
+	if !strings.Contains(pred, `auth.metadata["subscription-info"].organizationId != ""`) {
+		t.Errorf("predicate = %q, want non-empty organizationId check", pred)
 	}
 }
 
@@ -2166,8 +2343,7 @@ func TestFetchOIDCConfig_TTLExtraction(t *testing.T) {
 			}
 			if got == nil {
 				t.Fatal("expected non-nil oidcConfig, got nil")
-			}
-			if got.TTL != tc.wantTTL {
+			} else if got.TTL != tc.wantTTL {
 				t.Errorf("TTL = %d, want %d", got.TTL, tc.wantTTL)
 			}
 		})
@@ -2252,8 +2428,7 @@ func TestMaaSAuthPolicyReconciler_MissingModelRef_FailedPhase(t *testing.T) {
 	readyCond := apimeta.FindStatusCondition(policy.Status.Conditions, "Ready")
 	if readyCond == nil {
 		t.Fatal("Ready condition not found")
-	}
-	if readyCond.Status != metav1.ConditionFalse {
+	} else if readyCond.Status != metav1.ConditionFalse {
 		t.Errorf("expected Ready=False, got %v", readyCond.Status)
 	}
 }
@@ -2312,12 +2487,13 @@ func TestMaaSAuthPolicyReconciler_PartialModelRefs_DegradedPhase(t *testing.T) {
 	readyCond := apimeta.FindStatusCondition(policy.Status.Conditions, "Ready")
 	if readyCond == nil {
 		t.Fatal("Ready condition not found")
-	}
-	if readyCond.Status != metav1.ConditionFalse {
-		t.Errorf("expected Ready=False, got %v", readyCond.Status)
-	}
-	if readyCond.Reason != "PartialFailure" {
-		t.Errorf("expected reason PartialFailure, got %q", readyCond.Reason)
+	} else {
+		if readyCond.Status != metav1.ConditionFalse {
+			t.Errorf("expected Ready=False, got %v", readyCond.Status)
+		}
+		if readyCond.Reason != "PartialFailure" {
+			t.Errorf("expected reason PartialFailure, got %q", readyCond.Reason)
+		}
 	}
 }
 
@@ -2394,8 +2570,7 @@ func TestMaaSAuthPolicyReconciler_AllValidModelRefs_ActivePhase(t *testing.T) {
 	readyCond := apimeta.FindStatusCondition(policy.Status.Conditions, "Ready")
 	if readyCond == nil {
 		t.Fatal("Ready condition not found")
-	}
-	if readyCond.Status != metav1.ConditionTrue {
+	} else if readyCond.Status != metav1.ConditionTrue {
 		t.Errorf("expected Ready=True, got %v", readyCond.Status)
 	}
 
@@ -2443,15 +2618,16 @@ func TestMaaSAuthPolicyReconciler_NoSpec(t *testing.T) {
 	ready := apimeta.FindStatusCondition(got.Status.Conditions, "Ready")
 	if ready == nil {
 		t.Fatal("Ready condition not found")
-	}
-	if ready.Status != metav1.ConditionFalse {
-		t.Errorf("Ready.Status = %q, want %q", ready.Status, metav1.ConditionFalse)
-	}
-	if ready.Reason != string(maasv1alpha1.ReasonInvalidSpec) {
-		t.Errorf("Ready.Reason = %q, want %q", ready.Reason, maasv1alpha1.ReasonInvalidSpec)
-	}
-	if !strings.Contains(ready.Message, "spec is required") {
-		t.Errorf("Ready.Message = %q, expected it to contain %q", ready.Message, "spec is required")
+	} else {
+		if ready.Status != metav1.ConditionFalse {
+			t.Errorf("Ready.Status = %q, want %q", ready.Status, metav1.ConditionFalse)
+		}
+		if ready.Reason != string(maasv1alpha1.ReasonInvalidSpec) {
+			t.Errorf("Ready.Reason = %q, want %q", ready.Reason, maasv1alpha1.ReasonInvalidSpec)
+		}
+		if !strings.Contains(ready.Message, "spec is required") {
+			t.Errorf("Ready.Message = %q, expected it to contain %q", ready.Message, "spec is required")
+		}
 	}
 }
 

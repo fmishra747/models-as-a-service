@@ -43,18 +43,20 @@ pytest tests/<file>.py -v
 
 | File | Focus |
 |------|--------|
+| `test_smoke.py` | Read-only smoke checks: non-streaming and streaming (`text/event-stream`) chat/completions |
 | `test_subscription.py` | Subscription / inference flows |
 | `test_trlp_rate_grouping.py` | TRLP limits grouped by rate: shared limits, per-subscription and per-user budgets, rate edits, gateway wasm config size guard |
 | `test_api_keys.py` | `/v1/api-keys` |
 | `test_models_endpoint.py` | `/v1/models` |
-| `test_negative_security.py` | Security / negative paths |
+| `test_negative_security.py` | Security / negative paths on the **default** gateway (`GATEWAY_HOST`) |
 | `test_namespace_scoping.py` | Namespace wiring |
 | `test_external_models.py` | External model refs |
 | `test_tenant.py` | `default-tenant` (subscription namespace): Ready/phase, optional payload-processing (gateway namespace), user CRs not owned by Tenant |
-| `test_aitenant_lifecycle.py` | `AITenant` bootstrap create/delete; reserved namespace rejection |
+| `test_aitenant_lifecycle.py` | `AITenant` bootstrap create/delete; reserved namespace rejection; **serial:** revocation operand recovery when `maas-api-cleanup` SA is removed mid-delete |
 | `test_tenant_namespace_discovery.py` | Multi-tenant namespace discovery (S1), webhooks (S6); smoke enables `ENABLE_TENANT_NAMESPACE_DISCOVERY=true` by default |
 | `test_gateway_scoped_authpolicy.py` | Gateway-scoped `maas-gateway-auth` (S10 / #912); runs in default CI |
 | `test_multi_tenant_integration.py` | Multi-tenant lifecycle and coexistence scenarios; smoke enables tenant namespace discovery by default |
+| `test_tenant_model_inference.py` | Per-tenant inference, symmetric cross-gateway API-key isolation, AuthPolicy EnvoyFilter workload selectors (RHOAIENG-99372), and per-tenant gateway negative auth (RHOAIENG-100758; `TestTenantGatewayNegativeSecurity`) |
 | `test_multi_tenant_maas_api.py` | Per-tenant `maas-api` infrastructure (S24); gated by `ENABLE_S24_E2E=true` |
 | `test_tenant_auth_isolation.py` | Tenant-scoped API-key/OIDC isolation (S4); gated by `ENABLE_S4_E2E=true` and tenant API URLs |
 | `test_tenant_subscription_isolation.py` | Tenant-scoped subscription listing/selection (S4); gated by `ENABLE_S4_E2E=true` and tenant API URLs |
@@ -92,12 +94,32 @@ The S24/S4 suites are in the smoke list but intentionally skip until their backi
 
 External OIDC runs require `EXTERNAL_OIDC=true` and `OIDC_ISSUER_URL`, `OIDC_TOKEN_URL`, `OIDC_CLIENT_ID`, `OIDC_USERNAME`, `OIDC_PASSWORD` per your deploy/test setup.
 
+## Nightly tier (`@pytest.mark.nightly`)
+
+Tests marked `nightly` (for example `test_external_oidc.py` and per-tenant OIDC discovery) are **always excluded from passes 1–2**. They run only in **pass 3** (`-m nightly`) when `MAAS_PYTEST_INCLUDE_NIGHTLY=true` (set automatically when `EXTERNAL_OIDC=true` in prow, or explicitly on the ODH MaaS nightly in shepard). PR `/group-test` does not set that flag, so nightly tests are skipped there.
+
+Local opt-in via the runner:
+
+```bash
+MAAS_PYTEST_INCLUDE_NIGHTLY=true EXTERNAL_OIDC=true \
+  ./test/e2e/scripts/run_e2e_tests.sh
+```
+
+Or target nightly tests directly:
+
+```bash
+EXTERNAL_OIDC=true OIDC_ISSUER_URL=... OIDC_TOKEN_URL=... \
+  pytest tests/ -m nightly -v
+```
+
 ## Parallel execution (pytest-xdist)
 
-By default, `run_e2e_tests.sh` runs tests in **two marker-filtered passes** (default: 7 xdist workers on pass 1). `--serial-only` runs pass 2 (`-m serial`) only and skips non-serial tests:
+By default, `run_e2e_tests.sh` runs tests in **two marker-filtered passes** (default: 7 xdist workers on pass 1). `--serial-only` runs pass 2 (`-m "serial and not legacy_ipp"`) only and skips non-serial tests:
 
-1. **Pass 1:** `-m "not serial"` — parallel across files when `E2E_PARALLEL_WORKERS > 1` (`--dist=loadgroup`), or single-worker serial execution when `E2E_PARALLEL_WORKERS=1`
-2. **Pass 2:** `-m serial` — cluster-wide mutators (single worker): simulator-subscription lifecycle, UNCONFIGURED model auth, TRLP rebuilds, operator scale tests. Skipped when pass 1 fails (saves CI time on red runs).
+1. **Pass 1:** `-m "not serial and not legacy_ipp"` — parallel across files when `E2E_PARALLEL_WORKERS > 1` (`--dist=loadgroup`), or single-worker serial execution when `E2E_PARALLEL_WORKERS=1`
+2. **Pass 2:** `-m "serial and not legacy_ipp"` — cluster-wide mutators (single worker): simulator-subscription lifecycle, UNCONFIGURED model auth, TRLP rebuilds, operator scale tests. Skipped when pass 1 fails (saves CI time on red runs).
+
+Legacy maas-controller IPP suites (per-tenant IPP isolation, maas EnvoyFilter chain, ExternalModel reconciler) are marked `legacy_ipp` and skipped by default. Opt in with `pytest -m legacy_ipp` (from `test/e2e/` with env vars exported, or target specific files).
 
 Pass 1 and pass 2 must stay separate: several modules mix `@serial` tests with worker-tenant tests, and module-scoped fixtures reject a single session that selects both.
 
@@ -115,7 +137,7 @@ SKIP_DEPLOYMENT=true ./test/e2e/run-tests-quick.sh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `E2E_PARALLEL_WORKERS` | `7` | Parallel workers for pass 1 (`-m "not serial"`). Pass 2 (`@serial`) always runs on one worker. Set to `1` for single-worker pass 1 (no xdist); marker split is unchanged. |
+| `E2E_PARALLEL_WORKERS` | `7` | Parallel workers for pass 1 (`-m "not serial and not legacy_ipp"`). Pass 2 (`@serial`, not `legacy_ipp`) always runs on one worker. Set to `1` for single-worker pass 1 (no xdist); marker split is unchanged. |
 | `E2E_AUTHPOLICY_PHASE_TIMEOUT` | `120` (parallel) / `60` (serial) | MaaSAuthPolicy phase wait |
 | `E2E_GATEWAY_ENFORCED_TIMEOUT` | `240` (parallel) / `180` (serial) | Kuadrant gateway auth enforced wait |
 | `E2E_MULTITENANCY_PHASE_TIMEOUT` | `180` (parallel) / `120` (serial) | Tenant discovery phase wait |

@@ -23,6 +23,8 @@ import (
 	"maps"
 	"reflect"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
@@ -35,7 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -72,7 +74,7 @@ type MaaSModelRefReconciler struct {
 	AITenantNamespace string
 
 	// Recorder emits Kubernetes events for model identity conflict warnings.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 func (r *MaaSModelRefReconciler) gatewayName() string {
@@ -489,10 +491,20 @@ func crdExists(ctx context.Context, reader client.Reader, crdName string) bool {
 	return false
 }
 
+// crdPartialMetadata returns a PartialObjectMetadata stub for the CRD GVK.
+// Using metadata-only informers avoids caching full CRD objects (50–200KB each
+// due to OpenAPI schemas), which is the single biggest memory contributor on
+// large clusters with 600+ CRDs.
+func crdPartialMetadata() *metav1.PartialObjectMetadata {
+	m := &metav1.PartialObjectMetadata{}
+	m.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
+	return m
+}
+
 // registerWatchWhenCRDAppears dynamically registers a resource watch the first time
-// the target CRD becomes available. It watches CRD objects (always available) and
-// calls makeSource() exactly once via sync.Once when the named CRD is detected —
-// so multiple CRD update events never produce duplicate watchers. No pod restart needed.
+// the target CRD becomes available. It watches CRD metadata (to avoid caching full
+// objects) and calls makeSource() exactly once via sync.Once when the named CRD is
+// detected — so multiple CRD update events never produce duplicate watchers.
 func registerWatchWhenCRDAppears(
 	c controller.Controller,
 	mgr ctrl.Manager,
@@ -504,9 +516,9 @@ func registerWatchWhenCRDAppears(
 	var once sync.Once
 	return c.Watch(source.Kind(
 		mgr.GetCache(),
-		&apiextensionsv1.CustomResourceDefinition{},
-		handler.TypedEnqueueRequestsFromMapFunc[*apiextensionsv1.CustomResourceDefinition](
-			func(ctx context.Context, crd *apiextensionsv1.CustomResourceDefinition) []reconcile.Request {
+		crdPartialMetadata(),
+		handler.TypedEnqueueRequestsFromMapFunc[*metav1.PartialObjectMetadata](
+			func(ctx context.Context, crd *metav1.PartialObjectMetadata) []reconcile.Request {
 				if crd.Name != crdName {
 					return nil
 				}
@@ -521,6 +533,145 @@ func registerWatchWhenCRDAppears(
 			},
 		),
 	))
+}
+
+// registerWatchWhenCRDEstablished is registerWatchWhenCRDAppears for a watch with a
+// follow-up hook. Once the named CRD reports Established=True, it registers the watch and
+// then runs onEstablished, enqueuing the requests it returns on c. Unlike
+// registerWatchWhenCRDAppears, both steps are retried with backoff until they succeed.
+//
+// The CRD informer uses metadata-only objects to avoid caching full CRD specs.
+// The Established condition is checked via a live API read when the CRD name matches.
+func registerWatchWhenCRDEstablished(
+	c controller.Controller,
+	mgr ctrl.Manager,
+	crdName string,
+	makeSource func() source.Source,
+	onEstablished func(context.Context) ([]reconcile.Request, error),
+) error {
+	reader := mgr.GetAPIReader()
+	b := newCRDBootstrap(crdName, func() error { return c.Watch(makeSource()) }, onEstablished)
+	b.log.Info("CRD not yet registered at startup; will register watch when it is established")
+	return c.Watch(source.Kind(
+		mgr.GetCache(),
+		crdPartialMetadata(),
+		handler.TypedFuncs[*metav1.PartialObjectMetadata, reconcile.Request]{
+			CreateFunc: func(ctx context.Context, e event.TypedCreateEvent[*metav1.PartialObjectMetadata], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				b.handleMetadata(ctx, e.Object.Name, reader, q)
+			},
+			UpdateFunc: func(ctx context.Context, e event.TypedUpdateEvent[*metav1.PartialObjectMetadata], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				b.handleMetadata(ctx, e.ObjectNew.Name, reader, q)
+			},
+		},
+	))
+}
+
+// crdBootstrap runs the one-time setup for registerWatchWhenCRDEstablished.
+type crdBootstrap struct {
+	log           logr.Logger
+	crdName       string
+	register      func() error
+	onEstablished func(context.Context) ([]reconcile.Request, error)
+	initialDelay  time.Duration
+	maxDelay      time.Duration
+
+	started atomic.Bool
+	// done is closed when the watch is registered and the hook's requests are enqueued.
+	done chan struct{}
+}
+
+func newCRDBootstrap(crdName string, register func() error, onEstablished func(context.Context) ([]reconcile.Request, error)) *crdBootstrap {
+	return &crdBootstrap{
+		log:           ctrl.Log.WithName("crd-watcher").WithValues("crdName", crdName),
+		crdName:       crdName,
+		register:      register,
+		onEstablished: onEstablished,
+		initialDelay:  time.Second,
+		maxDelay:      time.Minute,
+		done:          make(chan struct{}),
+	}
+}
+
+// handleMetadata starts the bootstrap when a metadata-only CRD event matches.
+// It claims ownership via CompareAndSwap on the first matching event and polls
+// for the Established condition with exponential backoff on a background context
+// that outlives the event handler. The goroutine terminates when the process exits.
+func (b *crdBootstrap) handleMetadata(ctx context.Context, name string, reader client.Reader, q workqueue.TypedInterface[reconcile.Request]) {
+	if name != b.crdName || !b.started.CompareAndSwap(false, true) {
+		return
+	}
+	go b.waitForEstablishedAndRun(context.WithoutCancel(ctx), reader, q)
+}
+
+func (b *crdBootstrap) waitForEstablishedAndRun(ctx context.Context, reader client.Reader, q workqueue.TypedInterface[reconcile.Request]) {
+	defer close(b.done)
+	b.pollEstablished(ctx, reader)
+	if !b.retry(ctx, "register watch", b.register) {
+		return
+	}
+	b.log.Info("CRD established; watch registered dynamically")
+	b.retry(ctx, "run CRD established hook", func() error {
+		requests, err := b.onEstablished(ctx)
+		if err != nil {
+			return err
+		}
+		for _, req := range requests {
+			q.Add(req)
+		}
+		return nil
+	})
+}
+
+// pollEstablished polls indefinitely until the CRD reports Established=True.
+// API errors are logged at Error; "not yet established" is logged at V(1)
+// since it is the normal state during CRD install.
+func (b *crdBootstrap) pollEstablished(ctx context.Context, reader client.Reader) {
+	delay := b.initialDelay
+	for {
+		var crd apiextensionsv1.CustomResourceDefinition
+		if err := reader.Get(ctx, types.NamespacedName{Name: b.crdName}, &crd); err != nil {
+			b.log.Error(err, "failed to read CRD for Established check; retrying", "after", delay)
+		} else if crdEstablished(&crd) {
+			return
+		} else {
+			b.log.V(1).Info("CRD not yet established; retrying", "after", delay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, b.maxDelay)
+	}
+}
+
+// retry calls fn until it succeeds, doubling the delay between attempts up to maxDelay.
+// It reports false if ctx ends first.
+func (b *crdBootstrap) retry(ctx context.Context, what string, fn func() error) bool {
+	delay := b.initialDelay
+	for {
+		err := fn()
+		if err == nil {
+			return true
+		}
+		b.log.Error(err, "failed to "+what+" after CRD was established; retrying", "after", delay)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, b.maxDelay)
+	}
+}
+
+// crdEstablished reports whether the CRD has the Established=True condition.
+func crdEstablished(crd *apiextensionsv1.CustomResourceDefinition) bool {
+	for _, cond := range crd.Status.Conditions {
+		if cond.Type == apiextensionsv1.Established {
+			return cond.Status == apiextensionsv1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // unstructuredLLMIsvcReadyStatus extracts the Ready condition status from an
@@ -545,7 +696,7 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
 
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("maas-modelref-controller")
+		r.Recorder = mgr.GetEventRecorder("maas-modelref-controller")
 	}
 
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &maasv1alpha1.MaaSModelRef{}, modelRefNameIndex, modelRefNameIndexer); err != nil {
@@ -724,21 +875,23 @@ func routeRejectionsChanged(e event.UpdateEvent) bool {
 }
 
 // ippExternalModelChangedForModelRef drops inference ExternalModel status writes other
-// than status.httpRouteName, the only ExternalModel status MaaSModelRef reconcile reads.
+// than status.httpRouteName and the ready per-gateway routes, the only ExternalModel status
+// MaaSModelRef reconcile reads.
 func ippExternalModelChangedForModelRef() predicate.Predicate { //nolint:ireturn // source.Kind takes predicate.Predicate.
 	return predicate.Or(
 		predicate.GenerationChangedPredicate{},
-		predicate.Funcs{UpdateFunc: ippExternalModelRouteNameChanged},
+		predicate.Funcs{UpdateFunc: ippExternalModelRoutesChanged},
 	)
 }
 
-func ippExternalModelRouteNameChanged(e event.UpdateEvent) bool {
+func ippExternalModelRoutesChanged(e event.UpdateEvent) bool {
 	oldEM, okOld := e.ObjectOld.(*unstructured.Unstructured)
 	newEM, okNew := e.ObjectNew.(*unstructured.Unstructured)
 	if !okOld || !okNew {
 		return true
 	}
-	return ippExternalModelRouteName(oldEM) != ippExternalModelRouteName(newEM)
+	return ippExternalModelRouteName(oldEM) != ippExternalModelRouteName(newEM) ||
+		!maps.Equal(externalModelGatewayRoutes(oldEM), externalModelGatewayRoutes(newEM))
 }
 
 // ippExternalModelSource watches inference ExternalModels as unstructured: the type is

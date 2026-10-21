@@ -42,8 +42,9 @@ const (
 // network-admin-provisioned Gateway reference, the MaaS tenant config object,
 // and tenant-admin Roles.
 //
-// Praxis tenants (ai-gateway-controller owns payload processing) opt out of
-// maas-controller IPP via metadata.annotations["maas.opendatahub.io/payload-processing-type"]="praxis".
+// Payload processing defaults to praxis (ai-gateway-controller). Opt into
+// maas-controller legacy IPP via MaasTenantConfig annotation
+// maas.opendatahub.io/payload-processing-type=ipp.
 //
 // The AITenant name is used as a suffix for per-tenant maas-api resources
 // (e.g., "maas-api-{tenant-name}"). To fit within the Kubernetes 63-character
@@ -69,6 +70,11 @@ type AITenantSpec struct {
 	// +kubebuilder:validation:Optional
 	OIDC *TenantExternalOIDCConfig `json:"oidc,omitempty"`
 
+	// Responses requests tenant-owned Responses and Conversations support.
+	// Omission disables both APIs. AI Gateway owns runtime and storage readiness.
+	// +optional
+	Responses *AITenantResponsesConfig `json:"responses,omitempty"`
+
 	// RBAC is retained only for compatibility with existing AITenant manifests.
 	// The controller ignores this field and does not create RoleBindings from it.
 	//
@@ -85,6 +91,51 @@ type AITenantSpec struct {
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=64
 	Guardrails []GuardrailAttachment `json:"guardrails,omitempty"`
+}
+
+// AITenantResponsesConfig configures Responses infrastructure, not model capabilities.
+type AITenantResponsesConfig struct {
+	// Enabled enables Responses and Conversations together. Requires Praxis.
+	// +optional
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Storage selects the separate platform Responses database binding.
+	// It never reuses the MaaS API-key database or provisions a database.
+	// +optional
+	// +kubebuilder:default={}
+	Storage AITenantResponsesStorage `json:"storage,omitempty"`
+
+	// Retention limits persisted Responses, conversation items and continuation state.
+	// Omission does not request a tenant-specific retention limit.
+	// +optional
+	Retention *AITenantResponsesRetention `json:"retention,omitempty"`
+}
+
+// AITenantResponsesStorage selects the supported platform storage contract.
+type AITenantResponsesStorage struct {
+	// Mode selects the platform-provisioned Responses connection and CA binding.
+	// +optional
+	// +kubebuilder:default=PlatformDefault
+	// +kubebuilder:validation:Enum=PlatformDefault
+	Mode string `json:"mode,omitempty"`
+
+	// DeletionPolicy retains content when Responses is disabled or the tenant is deleted.
+	// Externally managed databases are never deleted by tenant reconciliation.
+	// +optional
+	// +kubebuilder:default=Retain
+	// +kubebuilder:validation:Enum=Retain
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+}
+
+// AITenantResponsesRetention requests a positive persisted-content lifetime.
+type AITenantResponsesRetention struct {
+	// MaxAge is a positive duration, for example "168h".
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="maxAge must be a positive duration"
+	MaxAge string `json:"maxAge"`
 }
 
 // AITenantGatewayRef references the existing Gateway API Gateway for this tenant.
@@ -158,5 +209,5 @@ type AITenantList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&AITenant{}, &AITenantList{})
+	register(&AITenant{}, &AITenantList{})
 }

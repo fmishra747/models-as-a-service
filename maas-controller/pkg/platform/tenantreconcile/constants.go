@@ -66,6 +66,21 @@ const (
 	// selected party may claim.
 	PayloadProcessingStatusCleanupComplete = "cleanup-complete"
 
+	// AnnotationForcePayloadProcessingMigration is the operator opt-in that allows
+	// IPP→Praxis migration when the live payload-processing-plugins ConfigMap is
+	// non-standard (RHOAIENG-98846). Value must be "true".
+	AnnotationForcePayloadProcessingMigration = "maas.opendatahub.io/force-payload-processing-migration"
+
+	// AnnotationPayloadProcessingMigration surfaces migration-gate state on
+	// MaasTenantConfig. Value PayloadProcessingMigrationBlocked means automatic
+	// migration is paused until the force annotation is applied (or the
+	// ConfigMap is restored to a known-good baseline).
+	AnnotationPayloadProcessingMigration = "maas.opendatahub.io/payload-processing-migration"
+
+	// PayloadProcessingMigrationBlocked is the AnnotationPayloadProcessingMigration
+	// value when the plugins ConfigMap gate refuses automatic migration.
+	PayloadProcessingMigrationBlocked = "blocked"
+
 	// ComponentName is the ODH component label key suffix (app.opendatahub.io/<name>).
 	// This is the DSC component identifier, not a standalone CR kind.
 	ComponentName = "modelsasservice"
@@ -100,10 +115,11 @@ const (
 	// Production deployments use this default. ROSA deployments must override to "" (empty) to disable separation.
 	DefaultInfraNamespace = "AUTO"
 
-	DefaultMaaSAPIImage            = "quay.io/opendatahub/maas-api:latest"
-	DefaultPayloadProcessingImage  = "quay.io/opendatahub/odh-ai-gateway-payload-processing:odh-stable"
-	DefaultMaaSAPIKeyCleanupImage  = "registry.redhat.io/ubi9/ubi-minimal:9.7"
-	DefaultAPIKeyMaxExpirationDays = "90"
+	DefaultMaaSAPIImage                = "quay.io/opendatahub/maas-api:latest"
+	DefaultPayloadProcessingImage      = "quay.io/opendatahub/odh-ai-gateway-payload-processing:odh-stable"
+	DefaultMaaSAPIKeyCleanupImage      = "registry.redhat.io/ubi9/ubi-minimal:9.7"
+	DefaultAPIKeyMaxExpirationDays     = "90"
+	DefaultAPIKeyDeletionRetentionDays = "90"
 
 	// DefaultOTLPCollectorService is the platform DSCI OpenTelemetry collector Service name.
 	DefaultOTLPCollectorService = "data-science-collector-collector"
@@ -134,6 +150,7 @@ const (
 	baseMaaSAPIServiceName                         = "maas-api"
 	baseMaaSAPIKeyCleanupScriptConfigMapName       = "maas-api-key-cleanup-script" //nolint:gosec // Kubernetes resource name, not a credential
 	baseMaaSAPIDeploymentNSNetworkPolicyName       = "maas-api-allow-deployment-ns"
+	baseMaaSAPIGatewayNetworkPolicyName            = "maas-api-allow-gateway"
 	baseMaaSAPIEgressRestrictNetworkPolicyName     = "maas-api-egress-restrict"
 	baseMaaSAPIServingCertName                     = "maas-api-serving-cert"
 	baseUsageLogsEnvoyFilterName                   = "maas-model-access-logs"
@@ -231,6 +248,13 @@ func MaaSAPIKeyCleanupCronJobName(tenantID string) string {
 
 func GatewayDestinationRuleName(tenantID string) string {
 	return resourceNameForTenant(baseGatewayDestinationRuleName, tenantID)
+}
+
+func MaaSAPIGatewayNetworkPolicyName(tenantID string) string {
+	if tenantID == "" {
+		return baseMaaSAPIGatewayNetworkPolicyName + "--default"
+	}
+	return resourceNameForTenant(baseMaaSAPIGatewayNetworkPolicyName, tenantID)
 }
 
 func TelemetryPolicyName(tenantID string) string {
