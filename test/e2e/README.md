@@ -34,6 +34,30 @@ Smoke helper only:
 - From repo root: `cd test/e2e`, create venv, `pip install -r requirements.txt`
 - Most HTTP tests need `GATEWAY_HOST` (and often routes/API reachable). Full env list: `tests/test_helper.py` docstring.
 
+Three env vars are easy to miss when running by hand rather than through
+`prow_run_smoke_test.sh`, and each fails in a way that does not name the cause:
+
+```bash
+# Required. The Gateway Route is maas-gateway-route; the Gateway CR is maas-default-gateway.
+export GATEWAY_HOST=$(oc get route maas-gateway-route -n openshift-ingress -o jsonpath='{.spec.host}')
+
+# RHOAI clusters. Defaults to "opendatahub", from which every infra namespace is derived;
+# on RHOAI that resolves to odh-ai-gateway-infra instead of redhat-ai-gateway-infra, and
+# tenant bootstrap then waits out its timeout on an HTTPRoute that is never created.
+export DEPLOYMENT_NAMESPACE=redhat-ods-applications
+
+# Per-tenant Gateway Routes are self-signed. CI supplies a CA bundle at /tmp/ca-bundle.crt;
+# locally there is none, so tenant-scoped HTTP calls fail TLS verification.
+export E2E_SKIP_TLS_VERIFY=true
+```
+
+Check `DEPLOYMENT_NAMESPACE` against the cluster rather than its name — an
+`odh-*` cluster may still run the controller in `redhat-ods-applications`:
+
+```bash
+oc get deploy -A | grep -E 'maas-controller|maas-api'
+```
+
 ## Pytest modules
 
 ```bash
@@ -62,10 +86,40 @@ pytest tests/<file>.py -v
 | `test_tenant_subscription_isolation.py` | Tenant-scoped subscription listing/selection (S4); gated by `ENABLE_S4_E2E=true` and tenant API URLs |
 | `test_tenant_rate_limit_isolation.py` | Tenant-scoped rate-limit isolation (S4); gated by `ENABLE_S4_E2E=true` and tenant API URLs |
 | `test_config_tenant.py` | Cluster `Config/default`: anchor present, owner refs on Tenant and `maas-controller` Deployment (skips if Config CRD missing) |
+| `test_non_default_maastenantconfig.py` | `MaasTenantConfig` settings on a **non-default** tenant (RHOAIENG-100759): `maasApi`, `payloadProcessing`/`payloadPreProcessing`, `apiKeys`, `telemetry`, each asserted to stay confined to the patched tenant |
 
 The shared CI runner and `smoke.sh` execute all tests under `tests/`. Individual modules can still be run directly, for example `pytest tests/test_subscription_list_endpoints.py -v`.
 
 **Skips:** `test_tenant.py` and `test_config_tenant.py` skip the whole module when the needed CRD or object is absent (partial cluster or older bundle). Neither module deletes Config or exercises DSC disable; that stays in operator or manual teardown.
+
+### MaasTenantConfig coverage: default vs non-default tenants
+
+`MaasTenantConfig` is a namespace-scoped singleton. Its name is always
+`default-tenant`, pinned by a CEL rule — the **namespace** is what scopes it to a
+tenant. So "the non-default tenant's config" is still `MaasTenantConfig/default-tenant`,
+living in that tenant's namespace, and it drives resources suffixed with the
+tenant name (`maas-api-{tenant}`, `payload-processing-{tenant}`).
+
+| `spec` field | Default tenant | Non-default tenant |
+|---|---|---|
+| `maasApi.replicas`, `.resources` | `test_tenant.py` | `test_non_default_maastenantconfig.py` |
+| `payloadProcessing.resources` | `test_tenant.py` | `test_non_default_maastenantconfig.py` |
+| `payloadPreProcessing.resources` | `test_tenant.py` | `test_non_default_maastenantconfig.py` |
+| `apiKeys.maxExpirationDays` | `test_api_keys.py` (platform default, config not patched) | `test_non_default_maastenantconfig.py` (policy patched, then enforced via that tenant's own maas-api) |
+| `telemetry` | `test_aitenant_lifecycle.py` — spec values persist on the CR | `test_non_default_maastenantconfig.py` — usage-log EnvoyFilter wiring matches the spec |
+| `guardrails` | none | none |
+
+Two conventions the non-default tests rely on, worth keeping if you extend them:
+
+- **Isolation is proved by comparison, not assumption.** Every prefix-matching
+  Deployment in the namespace is snapshotted before the patch, and only the
+  patched tenant's is allowed to differ afterwards. A single named comparison
+  would miss an override leaking onto a third tenant.
+- **A field missing from the installed CRD is skipped, not failed.** The API
+  server prunes unknown fields, so the patch appears to apply and the resource
+  never converges — indistinguishable from a product bug unless the schema is
+  checked first. Skips must name a follow-up issue so they do not become
+  permanent; `test_tenant.py` follows the same pattern for `spec.maasApi`.
 
 ## CI
 
