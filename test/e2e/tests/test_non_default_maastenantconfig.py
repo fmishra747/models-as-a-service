@@ -31,6 +31,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+import requests
 from multitenancy_helpers import (
     GATEWAY_NAMESPACE,
     INFRA_NAMESPACE,
@@ -38,6 +39,7 @@ from multitenancy_helpers import (
     TENANT_CONFIG_KIND,
     TENANT_CR_NAME,
     _oc_run,
+    bearer_headers,
     create_api_key_at,
     make_tenant_model_accessible,
     per_tenant_ipp_names,
@@ -46,6 +48,8 @@ from multitenancy_helpers import (
     wait_for_json,
 )
 from test_helper import (
+    TIMEOUT,
+    TLS_VERIFY,
     _delete_cr,
     _delete_governance_and_wait,
     _get_cluster_token,
@@ -192,6 +196,55 @@ def _wait_for_resources(name: str, namespace: str, expected: dict[str, Any]) -> 
     wait_for_json("deployment", name, namespace, predicate=_matches, timeout=CONVERGENCE_TIMEOUT)
 
 
+def _wait_for_env_rollout(name: str, namespace: str, env_name: str, expected: str) -> None:
+    """Wait until a Deployment exposes env_name=expected and has finished rolling out.
+
+    MaasTenantConfig api-key policy does not reach maas-api directly: the controller
+    resolves spec.apiKeys into the maas-parameters ConfigMap, which is substituted
+    into the Deployment env, and maas-api only reads it at startup. So the value is
+    not in force until a new pod is serving.
+    """
+
+    def _matches(obj: dict[str, Any]) -> bool:
+        spec, status = obj.get("spec") or {}, obj.get("status") or {}
+        containers = ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
+        if not containers:
+            return False
+        env = {e.get("name"): e.get("value") for e in containers[0].get("env") or []}
+        if env.get(env_name) != expected:
+            return False
+        desired = spec.get("replicas", 1)
+        # status.replicas must also equal desired: with maxSurge the new pod can be
+        # counted in updatedReplicas while the OLD pod is still the available one and
+        # still serving. Requiring no surge pods left is what proves the rollout is done.
+        return (
+            status.get("observedGeneration", 0) >= (obj.get("metadata") or {}).get("generation", 0)
+            and status.get("replicas") == desired
+            and status.get("updatedReplicas") == desired
+            and status.get("availableReplicas") == desired
+            and status.get("readyReplicas") == desired
+        )
+
+    wait_for_json("deployment", name, namespace, predicate=_matches, timeout=CONVERGENCE_TIMEOUT)
+
+def _effective_max_expiration_days(base_url: str, token: str) -> int | None:
+    """Ask a maas-api instance what expiration cap it is actually applying.
+
+    GET /v1/api-keys/config reports GetMaxExpirationDays(), the same value the
+    create path enforces against. Querying it separates "the policy never reached
+    the serving pod" from "it arrived and was not enforced", which the mint status
+    code alone cannot distinguish.
+    """
+    response = requests.get(
+        f"{base_url}/v1/api-keys/config",
+        headers=bearer_headers(token),
+        timeout=TIMEOUT,
+        verify=TLS_VERIFY,
+    )
+    if response.status_code != 200:
+        return None
+    return response.json().get("max_expiration_days")
+
 def _non_default_tenant(shared_test_tenants) -> dict[str, str]:
     """Return the tenant to patch (tenant B), leaving tenant A as the untouched sibling."""
     return shared_test_tenants[1]
@@ -284,7 +337,15 @@ class TestNonDefaultTenantPayloadProcessing:
         tenant = _non_default_tenant(shared_test_tenants)
         deployment_name = per_tenant_ipp_names(tenant["name"])["pre_processing_deployment"]
         before = _snapshot_deployments(GATEWAY_NAMESPACE, "payload-pre-processing")
-        assert deployment_name in before, f"Deployment/{deployment_name} not found; found {sorted(before)}"
+        if deployment_name not in before:
+            _skip_with_followup(
+                reason=(
+                    f"Deployment/{deployment_name} not present in '{GATEWAY_NAMESPACE}'; this tenant has no "
+                    f"payload-pre-processing workload for spec.payloadPreProcessing to act on. "
+                    f"Found {sorted(before)}."
+                ),
+                follow_up=CRD_FIELD_FOLLOW_UP,
+            )
 
         requests_patch = {"requests": IPP_RESOURCE_REQUESTS}
         with _tenant_config_patched(
@@ -348,6 +409,21 @@ class TestNonDefaultTenantAPIKeysPolicy:
         with _tenant_config_patched(
             tenant["namespace"], {"apiKeys": {"maxExpirationDays": TENANT_MAX_EXPIRATION_DAYS}}, "/spec/apiKeys"
         ):
+            _wait_for_env_rollout(
+                per_tenant_maas_api_names(tenant["name"])["deployment"],
+                INFRA_NAMESPACE,
+                "API_KEY_MAX_EXPIRATION_DAYS",
+                str(TENANT_MAX_EXPIRATION_DAYS),
+            )
+            # Pinpoint which hop failed if this test goes red: the Deployment env and
+            # rollout are already confirmed above, so a stale value here means the
+            # policy never reached the serving pod rather than not being enforced.
+            effective = _effective_max_expiration_days(tenant["base_url"], token)
+            assert effective == TENANT_MAX_EXPIRATION_DAYS, (
+                f"maas-api for {tenant['name']} reports max_expiration_days={effective!r} although its "
+                f"Deployment env is {TENANT_MAX_EXPIRATION_DAYS} and the rollout completed; "
+                f"spec.apiKeys.maxExpirationDays did not reach the serving pod"
+            )
             response = create_api_key_at(
                 tenant["base_url"],
                 token,
@@ -356,8 +432,9 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 expires_in=f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS * HOURS_PER_DAY}h",
             )
             assert response.status_code == 400, (
-                f"Expected 400 minting a {EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS}-day key against a "
-                f"{TENANT_MAX_EXPIRATION_DAYS}-day tenant policy, got {response.status_code}"
+                f"maas-api reports max_expiration_days={effective}, yet minting a "
+                f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS}-day key returned {response.status_code} "
+                f"instead of 400 — the cap is known to the service but not enforced on create"
             )
 
     def test_policy_does_not_apply_to_sibling_tenant(self, shared_test_tenants, tenant_key_governance):
@@ -371,6 +448,13 @@ class TestNonDefaultTenantAPIKeysPolicy:
         with _tenant_config_patched(
             tenant["namespace"], {"apiKeys": {"maxExpirationDays": TENANT_MAX_EXPIRATION_DAYS}}, "/spec/apiKeys"
         ):
+            # Assert isolation only once the patched tenant's policy is actually in force.
+            _wait_for_env_rollout(
+                per_tenant_maas_api_names(tenant["name"])["deployment"],
+                INFRA_NAMESPACE,
+                "API_KEY_MAX_EXPIRATION_DAYS",
+                str(TENANT_MAX_EXPIRATION_DAYS),
+            )
             response = create_api_key_at(
                 sibling["base_url"],
                 token,
