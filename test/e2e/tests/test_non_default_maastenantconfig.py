@@ -235,6 +235,44 @@ def _non_default_tenant(shared_test_tenants) -> dict[str, str]:
     return shared_test_tenants[1]
 
 
+@pytest.fixture(scope="module")
+def tenant_key_governance(shared_test_tenants):
+    """Give both shared tenants a model, MaaSAuthPolicy and MaaSSubscription.
+
+    Minting an API key through a tenant's own maas-api needs that tenant's gateway
+    AuthPolicy programmed, which maas-controller only reconciles once a tenant
+    MaaSAuthPolicy exists; without it every mint returns 500 AUTH_FAILURE. Mirrors
+    test_tenant_auth_isolation.py, which is the proven path for tenant-scoped keys.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    policy_name = f"e2e-mt-tenantcfg-{suffix}"
+    subscription_name = f"e2e-mt-tenantcfg-{suffix}"
+    cases = [dict(case) for case in shared_test_tenants]
+
+    for case in cases:
+        case["model_name"] = f"tenantcfg-model-{case['suffix']}"
+        provision_tenant_model(case["model_name"], case["tenant_ns"], case["gateway_name"])
+    try:
+        for case in cases:
+            make_tenant_model_accessible(
+                case["model_name"],
+                case["tenant_ns"],
+                policy_name,
+                subscription_name,
+                gateway_name=case["gateway_name"],
+                trlp_timeout=MODEL_BACKEND_READY_TIMEOUT,
+            )
+        yield subscription_name
+    finally:
+        _delete_governance_and_wait(
+            subscriptions=[(subscription_name, case["tenant_ns"]) for case in cases],
+            auth_policies=[(policy_name, case["tenant_ns"]) for case in cases],
+        )
+        for case in cases:
+            _delete_cr("maasmodelref", case["model_name"], case["tenant_ns"])
+            _delete_cr("llminferenceservice", case["model_name"], case["tenant_ns"])
+
+
 class TestNonDefaultTenantAPIKeysPolicy:
     """spec.apiKeys policy is enforced by the tenant's own maas-api and stays tenant-scoped."""
 
