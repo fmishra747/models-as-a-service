@@ -1681,6 +1681,41 @@ def bearer_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
+def create_api_key_at(
+    base_url: str,
+    oc_token: str,
+    name: str,
+    *,
+    subscription: Optional[str] = None,
+    expires_in: Optional[str] = None,
+) -> requests.Response:
+    """Create an API key against a tenant-scoped maas-api URL.
+
+    Retries empty 403 / Authorino AUTH_FAILURE while per-tenant gateway
+    AuthPolicy enforcement catches up (same flake mode as single-tenant helpers).
+
+    Args:
+        expires_in: Optional duration string (e.g. "168h"). Needed to exercise a
+            tenant's apiKeys.maxExpirationDays policy, which is only evaluated
+            when the request carries an expiry.
+    """
+    body: dict[str, str] = {"name": name}
+    if subscription:
+        body["subscription"] = subscription
+    if expires_in:
+        body["expiresIn"] = expires_in
+    return _request_with_gateway_retry(
+        requests.post,
+        f"{base_url}/v1/api-keys",
+        headers=bearer_headers(oc_token),
+        json=body,
+        retries=GATEWAY_PROPAGATION_RETRIES,
+        delay=GATEWAY_PROPAGATION_DELAY,
+        timeout=TIMEOUT,
+        verify=TLS_VERIFY,
+    )
+
+
 def get_api_key_at(base_url: str, oc_token: str, key_id: str) -> requests.Response:
     return requests.get(
         f"{base_url}/v1/api-keys/{key_id}",

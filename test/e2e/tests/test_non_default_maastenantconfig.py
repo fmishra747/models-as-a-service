@@ -65,11 +65,9 @@ CRD_FIELD_FOLLOW_UP = "RHOAIENG-100759"
 _FOLLOW_UP_RE = re.compile(r"(^[A-Z][A-Z0-9]+-\d+$)|(^https?://\S+$)")
 
 
-def _skip_with_followup(reason: str, follow_up: str) -> None:
 def _non_default_tenant(shared_test_tenants) -> dict[str, str]:
     """Return the tenant to patch (tenant B), leaving tenant A as the untouched sibling."""
     return shared_test_tenants[1]
-
 
 @pytest.fixture(scope="module")
 def tenant_key_governance(shared_test_tenants):
