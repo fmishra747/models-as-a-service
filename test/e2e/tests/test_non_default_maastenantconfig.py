@@ -1,16 +1,13 @@
 """MaasTenantConfig apiKeys settings on a non-default tenant (RHOAIENG-100759).
 
 Test that spec.apiKeys policy is enforced at a tenant's own maas-api without
-leaking to sibling tenants. Field-landing checks (maasApi, payloadProcessing,
-telemetry) are verified in operands_int_test.go (envtest) where they're stable
-and don't require xdist coordination.
+leaking to sibling tenants.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import re
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -27,7 +24,6 @@ from multitenancy_helpers import (
     bearer_headers,
     create_api_key_at,
     make_tenant_model_accessible,
-    per_tenant_ipp_names,
     per_tenant_maas_api_names,
     provision_tenant_model,
     wait_for_json,
@@ -44,13 +40,7 @@ from test_helper import (
 pytestmark = [pytest.mark.tenant_isolation, pytest.mark.xdist_group("tenant_isolation")]
 
 MAAS_TENANT_CONFIG_CRD = "maastenantconfigs.maas.opendatahub.io"
-USAGE_LOGS_ENVOY_FILTER_BASE = "maas-model-access-logs"
-
 CONVERGENCE_TIMEOUT = 300
-
-# Deliberately unusual values: a converged resource cannot be confused with a default.
-MAAS_API_RESOURCE_REQUESTS: dict[str, str] = {"cpu": "123m", "memory": "234Mi"}
-IPP_RESOURCE_REQUESTS: dict[str, str] = {"cpu": "137m", "memory": "251Mi"}
 
 # Far below the platform default so a key the tenant must reject stays acceptable
 # elsewhere, which is what makes the namespace-scoping check meaningful.
@@ -58,16 +48,84 @@ TENANT_MAX_EXPIRATION_DAYS = 7
 EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS = 30
 HOURS_PER_DAY = 24
 
-# Follow-ups for cases skipped because the installed CRD predates the field.
-# Replace with dedicated issues if these outlive RHOAIENG-100759.
+# Follow-up for cases skipped because the installed CRD predates the field.
 CRD_FIELD_FOLLOW_UP = "RHOAIENG-100759"
-
-_FOLLOW_UP_RE = re.compile(r"(^[A-Z][A-Z0-9]+-\d+$)|(^https?://\S+$)")
 
 
 def _non_default_tenant(shared_test_tenants) -> dict[str, str]:
     """Return the tenant to patch (tenant B), leaving tenant A as the untouched sibling."""
     return shared_test_tenants[1]
+
+
+@contextlib.contextmanager
+def _tenant_config_patched(tenant_namespace: str, spec_patch: dict[str, Any], *remove_paths: str) -> Iterator[None]:
+    """Merge-patch a tenant's MaasTenantConfig and remove the added paths on exit."""
+    body = json.dumps({"spec": spec_patch})
+    result = _oc_run(
+        ["patch", TENANT_CONFIG_KIND, TENANT_CR_NAME, "-n", tenant_namespace, "--type=merge", "-p", body]
+    )
+    assert result.returncode == 0, (
+        f"Failed to patch {TENANT_CONFIG_KIND}/{TENANT_CR_NAME} in '{tenant_namespace}': "
+        f"{(result.stderr or result.stdout or '').strip()}"
+    )
+    try:
+        yield
+    finally:
+        removals = json.dumps([{"op": "remove", "path": path} for path in remove_paths])
+        result = _oc_run(
+            ["patch", TENANT_CONFIG_KIND, TENANT_CR_NAME, "-n", tenant_namespace, "--type=json", "-p", removals]
+        )
+        assert result.returncode == 0, (
+            f"Failed to cleanup {TENANT_CONFIG_KIND}/{TENANT_CR_NAME} in '{tenant_namespace}': "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+
+
+def _wait_for_env_rollout(
+    deployment_name: str, namespace: str, env_var: str, expected_value: str, timeout: int = CONVERGENCE_TIMEOUT
+) -> None:
+    """Poll until a Deployment's container has the expected environment variable value."""
+
+    def _has_env_value(obj: dict[str, Any]) -> bool:
+        containers = (((obj.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
+        if not containers:
+            return False
+        env = containers[0].get("env") or []
+        for var in env:
+            if var.get("name") == env_var and var.get("value") == expected_value:
+                return True
+        return False
+
+    wait_for_json("deployment", deployment_name, namespace, predicate=_has_env_value, timeout=timeout)
+
+
+def _effective_max_expiration_days(
+    base_url: str, token: str, expected: int, timeout: int = CONVERGENCE_TIMEOUT
+) -> int:
+    """Poll the maas-api config endpoint until it reports the expected max expiration days."""
+    from timeout_sampler import TimeoutExpiredError, TimeoutSampler
+
+    headers = bearer_headers(token)
+    last_value = None
+    try:
+        for _ in TimeoutSampler(wait_timeout=timeout, sleep=5):
+            try:
+                response = requests.get(
+                    f"{base_url}/v1/api-keys/config", headers=headers, verify=TLS_VERIFY, timeout=30
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    last_value = data.get("maxExpirationDays")
+                    if last_value == expected:
+                        return last_value
+            except Exception:
+                pass
+    except TimeoutExpiredError:
+        raise AssertionError(
+            f"maas-api did not report maxExpirationDays={expected} within {timeout}s; "
+            f"last observed value was {last_value}"
+        )
+
 
 @pytest.fixture(scope="module")
 def tenant_key_governance(shared_test_tenants):
@@ -113,7 +171,7 @@ class TestNonDefaultTenantAPIKeysPolicy:
     def test_key_exceeding_tenant_policy_is_rejected(self, shared_test_tenants, tenant_key_governance):
         """Given spec.apiKeys.maxExpirationDays on a non-default MaasTenantConfig,
         when a key is minted through that tenant's maas-api with a longer expiry,
-        then the mint is rejected.
+        then the mint is rejected with an error message citing the cap.
         """
         tenant = _non_default_tenant(shared_test_tenants)
         token = _get_cluster_token()
@@ -126,7 +184,7 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 "API_KEY_MAX_EXPIRATION_DAYS",
                 str(TENANT_MAX_EXPIRATION_DAYS),
             )
-            # Poll until the serving pod reports the new policy value (verifies it reached the pod)
+            # Poll until the serving pod reports the new policy value
             effective = _effective_max_expiration_days(
                 tenant["base_url"],
                 token,
@@ -149,7 +207,7 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 f"Key under the {TENANT_MAX_EXPIRATION_DAYS}-day cap should succeed; "
                 f"minting a {TENANT_MAX_EXPIRATION_DAYS - 1}-day key returned {under_cap_response.status_code}"
             )
-            
+
             # Negative: exceeding the cap should be rejected with reason in response body
             over_cap_response = create_api_key_at(
                 tenant["base_url"],
@@ -164,44 +222,38 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 f"instead of 400 — the cap is known to the service but not enforced on create"
             )
             # Verify the response body explains why it was rejected
-            try:
-                body = over_cap_response.json()
-                error_msg = str(body).lower()
-                assert "exceeds" in error_msg or "maximum" in error_msg or "expiration" in error_msg, (
-                    f"Response body should explain the rejection; got: {body}"
-                )
-            except Exception as e:
-                # If body is not JSON, at least the 400 status proves enforcement
-                pass
+            body = over_cap_response.json()
+            error = body.get("error", "")
+            assert "exceeds" in error.lower() or "maximum allowed" in error.lower(), (
+                f"Error should mention the expiration cap; got: {error}"
+            )
 
     def test_policy_does_not_apply_to_sibling_tenant(self, shared_test_tenants, tenant_key_governance):
         """Given spec.apiKeys.maxExpirationDays set on one non-default tenant,
         when the same over-limit key is minted through a sibling tenant's maas-api,
         then it succeeds, showing the policy is namespace-scoped.
         """
-        sibling, tenant = shared_test_tenants[0], _non_default_tenant(shared_test_tenants)
+        tenant = _non_default_tenant(shared_test_tenants)
+        sibling = shared_test_tenants[0]
         token = _get_cluster_token()
-        expires_in = f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS * HOURS_PER_DAY}h"
         with _tenant_config_patched(
             tenant["namespace"], {"apiKeys": {"maxExpirationDays": TENANT_MAX_EXPIRATION_DAYS}}, "/spec/apiKeys"
         ):
-            # Assert isolation only once the patched tenant's policy is actually in force.
             _wait_for_env_rollout(
                 per_tenant_maas_api_names(tenant["name"])["deployment"],
                 INFRA_NAMESPACE,
                 "API_KEY_MAX_EXPIRATION_DAYS",
                 str(TENANT_MAX_EXPIRATION_DAYS),
             )
+            # Sibling tenant should not have the policy and should accept 30-day keys
             response = create_api_key_at(
                 sibling["base_url"],
                 token,
-                f"e2e-mt-policy-sibling-{uuid.uuid4().hex[:6]}",
+                f"e2e-mt-sibling-policy-{uuid.uuid4().hex[:6]}",
                 subscription=tenant_key_governance,
-                expires_in=expires_in,
+                expires_in=f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS * HOURS_PER_DAY}h",
             )
             assert response.status_code in (200, 201), (
                 f"Sibling tenant should not inherit the {TENANT_MAX_EXPIRATION_DAYS}-day policy; "
                 f"minting a {EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS}-day key returned {response.status_code}"
             )
-
-
