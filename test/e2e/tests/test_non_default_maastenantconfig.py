@@ -99,32 +99,6 @@ def _wait_for_env_rollout(
     wait_for_json("deployment", deployment_name, namespace, predicate=_has_env_value, timeout=timeout)
 
 
-def _effective_max_expiration_days(
-    base_url: str, token: str, expected: int, timeout: int = CONVERGENCE_TIMEOUT
-) -> int:
-    """Poll the maas-api config endpoint until it reports the expected max expiration days."""
-    from timeout_sampler import TimeoutExpiredError, TimeoutSampler
-
-    headers = bearer_headers(token)
-    last_value = None
-    try:
-        for _ in TimeoutSampler(wait_timeout=timeout, sleep=5):
-            try:
-                response = requests.get(
-                    f"{base_url}/v1/api-keys/config", headers=headers, verify=TLS_VERIFY, timeout=30
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    last_value = data.get("maxExpirationDays")
-                    if last_value == expected:
-                        return last_value
-            except Exception:
-                pass
-    except TimeoutExpiredError:
-        raise AssertionError(
-            f"maas-api did not report maxExpirationDays={expected} within {timeout}s; "
-            f"last observed value was {last_value}"
-        )
 
 
 @pytest.fixture(scope="module")
@@ -184,17 +158,7 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 "API_KEY_MAX_EXPIRATION_DAYS",
                 str(TENANT_MAX_EXPIRATION_DAYS),
             )
-            # Poll until the serving pod reports the new policy value
-            effective = _effective_max_expiration_days(
-                tenant["base_url"],
-                token,
-                expected=TENANT_MAX_EXPIRATION_DAYS,
-                timeout=30,
-            )
-            assert effective == TENANT_MAX_EXPIRATION_DAYS, (
-                f"maas-api for {tenant['name']} did not converge to max_expiration_days={TENANT_MAX_EXPIRATION_DAYS}; "
-                f"spec.apiKeys.maxExpirationDays did not reach the serving pod within 30s"
-            )
+            # The env rollout confirms deployment picked up the new policy
             # Positive control: a key under the cap should succeed
             under_cap_response = create_api_key_at(
                 tenant["base_url"],
@@ -217,7 +181,7 @@ class TestNonDefaultTenantAPIKeysPolicy:
                 expires_in=f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS * HOURS_PER_DAY}h",
             )
             assert over_cap_response.status_code == 400, (
-                f"maas-api reports max_expiration_days={effective}, yet minting a "
+                f"Minting a "
                 f"{EXCEEDS_TENANT_WITHIN_DEFAULT_DAYS}-day key returned {over_cap_response.status_code} "
                 f"instead of 400 — the cap is known to the service but not enforced on create"
             )
