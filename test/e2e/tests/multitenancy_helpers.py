@@ -21,6 +21,8 @@ MODEL_BACKEND_READY_TIMEOUT = int(os.environ.get("E2E_MODEL_BACKEND_READY_TIMEOU
 
 from test_helper import (
     DEPLOYMENT_NAMESPACE,
+    GATEWAY_PROPAGATION_DELAY,
+    GATEWAY_PROPAGATION_RETRIES,
     MAAS_API_DEPLOYMENT_NAMESPACE,
     MODEL_NAMESPACE,
     MODEL_REF,
@@ -32,6 +34,7 @@ from test_helper import (
     _delete_cr,
     _is_transient_gateway_response,
     _ns,
+    _request_with_gateway_retry,
     _run_oc,
     create_api_key_at,  # noqa: F401 - re-exported for tenant-scoped maas-api callers
     kubectl_curl,
